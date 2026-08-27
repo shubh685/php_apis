@@ -12,16 +12,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 require_once __DIR__ . '/database.php';
 
 function api_base_url() {
-    $https = (!empty($_SERVER['HTTPS']) && strtolower($_SERVER['HTTPS']) !== 'off') || (isset($_SERVER['SERVER_PORT']) && (int)$_SERVER['SERVER_PORT'] === 443);
-    $protocol = $https ? 'https' : 'http';
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     $script = $_SERVER['SCRIPT_NAME'] ?? '';
     $directory = str_replace('\\', '/', dirname($script));
     $directory = trim($directory, '/');
+    
+    $scheme = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on') ? 'https://' : 'http://';
+
     if ($directory === '' || $directory === '.') {
-        return $protocol . '://' . $host;
+        return $scheme . $host;
     }
-    return $protocol . '://' . $host . '/' . $directory;
+    return $scheme . $host . '/' . $directory;
 }
 
 function uploads_dir() {
@@ -88,7 +89,7 @@ function save_uploaded($file,$prefix) {
 
 function uploaded_images($prefix) {
     $saved = [];
-    foreach (['photos', 'images', 'files', 'photo', 'image', 'images[]'] as $field) {
+    foreach (['photos', 'images', 'files', 'photo', 'image'] as $field) {
         if (isset($_FILES[$field]) && is_array($_FILES[$field]['name'])) {
             $count = count($_FILES[$field]['name']);
             for ($i = 0; $i < $count; $i++) {
@@ -116,7 +117,6 @@ function public_image_url($value) {
     $value = trim((string)$value);
     if ($value === '') return '';
 
-    // Direct Pass for absolute HTTP/HTTPS URLs or Base64 strings
     if (preg_match('#^https?://#i', $value) || strpos($value, 'data:image/') === 0) {
         return $value;
     }
@@ -124,7 +124,6 @@ function public_image_url($value) {
     $value = str_replace('\\', '/', $value);
     $value = ltrim($value, '/');
 
-    // Clean out unintended path prefixes
     $prefixes = ['bindu_decor/', 'api/bindu_decor/', 'uploads/uploads/'];
     foreach ($prefixes as $prefix) {
         if (stripos($value, $prefix) === 0) {
@@ -133,7 +132,7 @@ function public_image_url($value) {
         }
     }
 
-    if (stripos($value, 'uploads/') !== 0) {
+    if (stripos($value, 'uploads/') !== 0 && stripos($value, 'image.php') !== 0) {
         $value = 'uploads/' . $value;
     }
 
@@ -158,25 +157,61 @@ function sanitize_status($status) {
     return in_array($status, ['Draft', 'Published'], true) ? $status : 'Draft';
 }
 
+/**
+ * IMPORTANT: Process blog photos with proper existing URLs retention
+ */
 function process_blog_photos($existing_photos_json = null) {
-    // Process physical uploaded files directly
-    $uploaded_paths = uploaded_images('blog');
-
-    $input = json_decode(file_get_contents("php://input"), true) ?? $_POST;
+    $clean_photos = [];
     
-    $raw_photos = $input['photos'] ?? $input['external_urls'] ?? [];
-    if (isset($input['external_urls[]'])) {
-        $ext = $input['external_urls[]'];
-        $raw_photos = is_array($ext) ? $ext : [$ext];
-    }
-    
-    if (is_string($raw_photos)) {
-        $decoded = json_decode($raw_photos, true);
-        $raw_photos = is_array($decoded) ? $decoded : [$raw_photos];
+    // ✅ STEP 1: ALWAYS preserve existing photos
+    if (!empty($existing_photos_json)) {
+        $existing = json_decode($existing_photos_json, true);
+        if (is_array($existing)) {
+            foreach ($existing as $ex_photo) {
+                if (!empty($ex_photo) && !in_array($ex_photo, $clean_photos, true)) {
+                    $clean_photos[] = $ex_photo;
+                }
+            }
+        }
     }
 
-    $clean_photos = $uploaded_paths;
+    // ✅ STEP 2: Save uploaded physical files
+    $uploaded = uploaded_images('blog');
+    foreach ($uploaded as $upload) {
+        if (!in_array($upload, $clean_photos, true)) {
+            $clean_photos[] = $upload;
+        }
+    }
 
+    // ✅ STEP 3: Read JSON input from php://input
+    $input = json_decode(file_get_contents("php://input"), true);
+    if (!is_array($input)) {
+        $input = [];
+    }
+
+    // ✅ STEP 4: Extract multiple URLs from various sources
+    $raw_photos = [];
+
+    $sources = [$_POST, $_GET, $input];
+    foreach ($sources as $source) {
+        foreach (['photos', 'photos[]', 'images', 'images[]', 'photo', 'image'] as $key) {
+            if (isset($source[$key])) {
+                $val = $source[$key];
+                if (is_array($val)) {
+                    $raw_photos = array_merge($raw_photos, $val);
+                } else if (is_string($val) && trim($val) !== '') {
+                    $decoded = json_decode($val, true);
+                    if (is_array($decoded)) {
+                        $raw_photos = array_merge($raw_photos, $decoded);
+                    } else {
+                        $raw_photos[] = $val;
+                    }
+                }
+            }
+        }
+    }
+
+    // ✅ STEP 5: Normalize external HTTP/HTTPS URLs & relative paths
     foreach ($raw_photos as $img) {
         $img = trim((string)$img);
         if ($img === '') continue;
@@ -197,19 +232,20 @@ function process_blog_photos($existing_photos_json = null) {
         $img = str_replace('\\', '/', $img);
         $img = ltrim($img, '/');
 
+        $prefixes = ['bindu_decor/', 'api/bindu_decor/', 'uploads/uploads/'];
+        foreach ($prefixes as $prefix) {
+            if (stripos($img, $prefix) === 0) {
+                $img = substr($img, strlen($prefix));
+                break;
+            }
+        }
+
         if ($img !== '' && !in_array($img, $clean_photos, true)) {
             $clean_photos[] = $img;
         }
     }
 
-    if (empty($clean_photos) && $existing_photos_json) {
-        $existing = json_decode($existing_photos_json, true);
-        if (is_array($existing) && !empty($existing)) {
-            return $existing_photos_json;
-        }
-    }
-
-    return json_encode(array_values($clean_photos));
+    return json_encode(array_values(array_unique($clean_photos)));
 }
 
 function is_duplicate_title($pdo, $title, $exclude_id = null) {
@@ -286,6 +322,7 @@ try {
                 }
 
                 $status = sanitize_status($input['status'] ?? $existing['status']);
+                // ✅ Pass existing photos to preserve them
                 $photos = process_blog_photos($existing['photos']);
 
                 $stmt = $pdo->prepare("UPDATE blogs SET title = ?, subject = ?, description = ?, author_name = ?, status = ?, photos = ? WHERE id = ?");
@@ -318,7 +355,8 @@ try {
             }
 
             $status = sanitize_status($input['status'] ?? 'Draft');
-            $photos = process_blog_photos();
+            // ✅ New blog: no existing photos needed
+            $photos = process_blog_photos(null);
 
             $stmt = $pdo->prepare("INSERT INTO blogs (title, subject, description, author_name, status, photos) VALUES (?, ?, ?, ?, ?, ?)");
             $stmt->execute([
@@ -376,6 +414,7 @@ try {
             }
 
             $status = sanitize_status($input['status'] ?? $existing['status']);
+            // ✅ Pass existing photos to preserve them
             $photos = process_blog_photos($existing['photos']);
 
             $stmt = $pdo->prepare("UPDATE blogs SET title = ?, subject = ?, description = ?, author_name = ?, status = ?, photos = ? WHERE id = ?");
