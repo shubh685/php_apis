@@ -1,15 +1,19 @@
 <?php
 header("Access-Control-Allow-Origin: *");
-header("Access-Control-Allow-Headers: Content-Type, X-Requested-With");
-header("Access-Control-Allow-Methods: POST, GET, OPTIONS");
-header("Content-Type: application/json");
+header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Access-Control-Allow-Headers, Authorization, X-Requested-With");
+header("Content-Type: application/json; charset=UTF-8");
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
-    exit;
+    exit();
 }
 
 require_once __DIR__ . '/database.php';
+
+ini_set('display_errors', 1);
+ini_set('log_errors', 1);
+ini_set('error_log', __DIR__ . '/error_log.txt');
 
 function api_json($status, $message = '', $data = [], $code = 200) {
     http_response_code($code);
@@ -23,433 +27,292 @@ function api_json($status, $message = '', $data = [], $code = 200) {
 function api_base_url() {
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     $script = $_SERVER['SCRIPT_NAME'] ?? '';
-    $directory = trim(str_replace('\\', '/', dirname($script)), '/');
+    $directory = str_replace('\\', '/', dirname($script));
+    $directory = trim($directory, '/');
 
-    $is_https = (
-        (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ||
-        (($_SERVER['SERVER_PORT'] ?? 80) == 443)
-    );
-    $scheme = $is_https ? 'https://' : 'http://';
+    $scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') || (($_SERVER['SERVER_PORT'] ?? 80) == 443) ? 'https://' : 'http://';
 
-    return $directory === '' || $directory === '.'
-        ? $scheme . $host
-        : $scheme . $host . '/' . $directory;
+    if ($directory === '' || $directory === '.') {
+        return $scheme . $host;
+    }
+    return $scheme . $host . '/' . $directory;
 }
 
 function uploads_dir() {
     $dir = __DIR__ . DIRECTORY_SEPARATOR . 'uploads' . DIRECTORY_SEPARATOR;
-
     if (!is_dir($dir) && !mkdir($dir, 0755, true)) {
         api_json('error', 'Unable to create uploads directory.', [], 500);
     }
-
     if (!is_writable($dir)) {
         @chmod($dir, 0755);
         if (!is_writable($dir)) {
             api_json('error', 'Uploads directory is not writable.', [], 500);
         }
     }
-
     return $dir;
 }
 
 function image_ext($mime, $name = '') {
-    $map = [
-        'image/jpeg' => 'jpg',
-        'image/jpg'  => 'jpg',
-        'image/png'  => 'png',
-        'image/webp' => 'webp',
-        'image/gif'  => 'gif',
-        'image/bmp'  => 'bmp',
-        'image/x-ms-bmp' => 'bmp',
-        'image/avif' => 'avif'
-    ];
-
+    $map = ['image/jpeg' => 'jpg', 'image/jpg' => 'jpg', 'image/png' => 'png', 'image/webp' => 'webp', 'image/gif' => 'gif', 'image/bmp' => 'bmp', 'image/avif' => 'avif'];
     $mime = strtolower(trim((string)$mime));
     if (isset($map[$mime])) return $map[$mime];
-
-    $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
-    if ($ext === 'jpeg') $ext = 'jpg';
-
-    return in_array($ext, ['jpg','png','webp','gif','bmp','avif'], true)
-        ? $ext
-        : 'jpg';
+    $e = strtolower(pathinfo($name, PATHINFO_EXTENSION));
+    if ($e === 'jpeg') $e = 'jpg';
+    return in_array($e, ['jpg', 'png', 'webp', 'gif', 'bmp', 'avif'], true) ? $e : 'jpg';
 }
 
 function valid_image($path) {
-    if (!is_file($path) || filesize($path) <= 0) {
-        return [false, 'Image file is empty or missing.'];
-    }
-
+    if (!is_file($path) || filesize($path) <= 0) return [false, 'Image file is empty or missing.'];
     $info = @getimagesize($path);
-    if ($info === false) {
-        return [false, 'File is not a valid image.'];
-    }
-
+    if ($info === false) return [false, 'File is not a valid image.'];
     $mime = strtolower((string)($info['mime'] ?? ''));
-    $allowed = [
-        'image/jpeg','image/png','image/webp',
-        'image/gif','image/bmp','image/x-ms-bmp','image/avif'
-    ];
-
-    if (!in_array($mime, $allowed, true)) {
-        return [false, 'Unsupported image type: ' . $mime];
-    }
-
+    $allowed = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/bmp', 'image/avif'];
+    if (!in_array($mime, $allowed, true)) return [false, 'Unsupported image type: ' . $mime];
     return [true, $mime];
 }
 
 function unique_image_name($prefix, $ext) {
-    return $prefix . '_' . date('Ymd_His') . '_' .
-        bin2hex(random_bytes(8)) . '.' . $ext;
+    return $prefix . '_' . date('Ymd_His') . '_' . bin2hex(random_bytes(8)) . '.' . $ext;
 }
 
 function save_uploaded($file, $prefix) {
-    if (($file['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+    if (!isset($file['error']) || $file['error'] !== UPLOAD_ERR_OK) {
         return [false, 'Upload failed. Error code: ' . ($file['error'] ?? 'unknown')];
     }
-
     if (empty($file['tmp_name']) || !is_uploaded_file($file['tmp_name'])) {
         return [false, 'Invalid uploaded file.'];
     }
-
     [$ok, $mime] = valid_image($file['tmp_name']);
     if (!$ok) return [false, $mime];
-
     $name = unique_image_name($prefix, image_ext($mime, $file['name'] ?? ''));
     $dest = uploads_dir() . $name;
-
     if (!move_uploaded_file($file['tmp_name'], $dest)) {
         return [false, 'Unable to save uploaded image. Check uploads permissions.'];
     }
-
     @chmod($dest, 0644);
-
-    return is_file($dest) && filesize($dest) > 0
-        ? [true, 'uploads/' . $name]
-        : [false, 'Uploaded image was not saved correctly.'];
-}
-
-function uploaded_images_array($prefix) {
-    $saved = [];
-    $fields = ['imageFile','image','images','image_file','file','files','media','photo','photos','logo'];
-
-    foreach ($fields as $field) {
-        if (!isset($_FILES[$field])) continue;
-
-        $f = $_FILES[$field];
-
-        if (is_array($f['name'])) {
-            foreach ($f['name'] as $i => $name) {
-                if (($f['error'][$i] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) continue;
-
-                $single = [
-                    'name' => $f['name'][$i],
-                    'type' => $f['type'][$i] ?? '',
-                    'tmp_name' => $f['tmp_name'][$i],
-                    'error' => $f['error'][$i],
-                    'size' => $f['size'][$i] ?? 0
-                ];
-
-                [$ok, $path] = save_uploaded($single, $prefix);
-                if ($ok) $saved[] = $path;
-            }
-        } else {
-            if (($f['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK) {
-                [$ok, $path] = save_uploaded($f, $prefix);
-                if ($ok) $saved[] = $path;
-            }
-        }
+    if (!is_file($dest) || filesize($dest) <= 0) {
+        return [false, 'Uploaded image was not saved correctly.'];
     }
-
-    return $saved;
-}
-
-/* Reusable extractor (same as used in products/blogs) */
-function extract_image_urls_from_sources() {
-    $result = [];
-
-    $keys = [
-        'image_urls','image_urls[]','image_url',
-        'imageUrls','imageUrls[]','imageUrl',
-        'images','photos','photo','img_url','url','urls','media_url',
-        'external_urls','external_urls[]','external_url'
-    ];
-
-    $sources = [$_POST, $_GET];
-
-    $rawBody = file_get_contents('php://input');
-    $jsonBody = json_decode($rawBody, true);
-    if (is_array($jsonBody)) $sources[] = $jsonBody;
-
-    foreach ($sources as $source) {
-        foreach ($keys as $key) {
-            if (!array_key_exists($key, $source)) continue;
-
-            $values = is_array($source[$key]) ? $source[$key] : [$source[$key]];
-
-            foreach ($values as $value) {
-                if (!is_string($value)) continue;
-
-                $value = trim($value);
-                if ($value === '') continue;
-
-                $decoded = json_decode($value, true);
-
-                if (is_array($decoded)) {
-                    foreach ($decoded as $item) {
-                        if (is_string($item) && trim($item) !== '') {
-                            $result[] = trim($item);
-                        }
-                    }
-                    continue;
-                }
-
-                $parts = preg_split('/[\r\n,;]+/', $value);
-                foreach ($parts as $part) {
-                    $part = trim($part);
-                    if ($part !== '') $result[] = $part;
-                }
-            }
-        }
-    }
-
-    return array_values(array_unique($result));
-}
-
-function download_external_image($url, $prefix) {
-    $url = trim($url);
-
-    if (!preg_match('#^https?://#i', $url)) {
-        return [false, 'Only HTTP/HTTPS image URLs are supported.'];
-    }
-
-    if (!function_exists('curl_init')) {
-        return [false, 'PHP cURL extension is not enabled.'];
-    }
-
-    $ch = curl_init($url);
-
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS => 5,
-        CURLOPT_CONNECTTIMEOUT => 15,
-        CURLOPT_TIMEOUT => 45,
-        CURLOPT_USERAGENT => 'Mozilla/5.0',
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_SSL_VERIFYHOST => 2,
-        CURLOPT_HTTPHEADER => [
-            'Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
-        ]
-    ]);
-
-    $body = curl_exec($ch);
-    $http = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $error = curl_error($ch);
-    curl_close($ch);
-
-    if ($body === false || $http < 200 || $http >= 400) {
-        return [false, 'Unable to download image. HTTP ' . $http . ($error ? ': ' . $error : '')];
-    }
-
-    $tmp = tempnam(sys_get_temp_dir(), 'img_');
-    if ($tmp === false || file_put_contents($tmp, $body) === false) {
-        @unlink($tmp);
-        return [false, 'Unable to create temporary image file.'];
-    }
-
-    [$ok, $mime] = valid_image($tmp);
-
-    if (!$ok) {
-        @unlink($tmp);
-        return [false, 'Remote URL did not return a valid image.'];
-    }
-
-    $ext = image_ext($mime, parse_url($url, PHP_URL_PATH) ?? '');
-    $name = unique_image_name($prefix, $ext);
-    $dest = uploads_dir() . $name;
-
-    if (!rename($tmp, $dest)) {
-        if (!copy($tmp, $dest)) {
-            @unlink($tmp);
-            return [false, 'Unable to save downloaded image.'];
-        }
-        @unlink($tmp);
-    }
-
-    @chmod($dest, 0644);
-
     return [true, 'uploads/' . $name];
 }
 
-function normalize_stored_path($value) {
-    $value = trim((string)$value);
-    if ($value === '') return '';
+function uploaded_images($prefix) {
+    $saved = [];
+    $fields = ['image_urls', 'image_urls[]', 'image_url', 'imageUrls', 'imageUrls[]', 'imageUrl', 'images', 'photos', 'photo', 'img_url', 'file', 'files', 'media'];
 
-    if (preg_match('#^https?://#i', $value)) return $value;
-
-    $base = rtrim(api_base_url(), '/');
-    if (stripos($value, $base . '/') === 0) {
-        $value = substr($value, strlen($base) + 1);
-    }
-
-    $value = ltrim(str_replace('\\', '/', $value), '/');
-
-    foreach (['bindu_decor/','api/bindu_decor/','uploads/uploads/'] as $prefix) {
-        if (stripos($value, $prefix) === 0) {
-            $value = substr($value, strlen($prefix));
-            break;
+    foreach ($fields as $field) {
+        if (isset($_FILES[$field]) && is_array($_FILES[$field]['name'])) {
+            $count = count($_FILES[$field]['name']);
+            for ($i = 0; $i < $count; $i++) {
+                if (($_FILES[$field]['error'][$i] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK) {
+                    $single_file = [
+                        'name' => $_FILES[$field]['name'][$i],
+                        'type' => $_FILES[$field]['type'][$i],
+                        'tmp_name' => $_FILES[$field]['tmp_name'][$i],
+                        'error' => $_FILES[$field]['error'][$i],
+                        'size' => $_FILES[$field]['size'][$i]
+                    ];
+                    [$ok, $path] = save_uploaded($single_file, $prefix);
+                    if ($ok) $saved[] = $path;
+                }
+            }
+        } elseif (isset($_FILES[$field]) && ($_FILES[$field]['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK) {
+            [$ok, $path] = save_uploaded($_FILES[$field], $prefix);
+            if ($ok) $saved[] = $path;
         }
     }
-
-    if (stripos($value, 'uploads/') !== 0 &&
-        stripos($value, 'image.php') !== 0) {
-        $value = 'uploads/' . $value;
-    }
-
-    return $value;
+    return $saved;
 }
 
-/* public_image_url: use blogs.php behavior (direct /uploads/... link) */
 function public_image_url($value) {
     $value = trim((string)$value);
-    if ($value === '') return '';
+    if ($value === '' || $value === 'null' || $value === 'undefined') return '';
 
-    if (preg_match('#^https?://#i', $value) ||
-        strpos($value, 'data:image/') === 0) {
+    // If it's already a valid absolute URL or data URI, return it clean without rawurlencode!
+    if (preg_match('#^https?://#i', $value) || strpos($value, 'data:image/') === 0) {
         return $value;
     }
 
-    $value = ltrim(str_replace('\\', '/', $value), '/');
+    $value = str_replace('\\', '/', $value);
+    $value = ltrim($value, '/');
 
-    foreach (['bindu_decor/','api/bindu_decor/','uploads/uploads/'] as $prefix) {
+    $prefixes = ['bindu_decor/', 'api/bindu_decor/', 'uploads/uploads/'];
+    foreach ($prefixes as $prefix) {
         if (stripos($value, $prefix) === 0) {
             $value = substr($value, strlen($prefix));
             break;
         }
     }
 
-    if (stripos($value, 'uploads/') !== 0 &&
-        stripos($value, 'image.php') !== 0) {
+    if (stripos($value, 'uploads/') !== 0 && stripos($value, 'image.php') !== 0) {
         $value = 'uploads/' . $value;
     }
 
-    return rtrim(api_base_url(), '/') . '/' . ltrim($value, '/');
+    return rtrim(api_base_url(), '/') . '/' . $value;
 }
 
 function resolve_photo_array($photos_json) {
     if (empty($photos_json)) return [];
 
     $photos = json_decode($photos_json, true);
-    if (!is_array($photos)) $photos = [$photos_json];
+    if (!is_array($photos)) {
+        $photos = [$photos_json];
+    }
+
+    $formatted = [];
+    foreach ($photos as $img) {
+        $url = public_image_url($img);
+        if ($url !== '' && !in_array($url, $formatted, true)) {
+            $formatted[] = $url;
+        }
+    }
+    return $formatted;
+}
+
+function resolve_image_urls($raw) {
+    if (empty($raw)) return [];
+
+    $urls = [];
+    if (is_string($raw)) {
+        $decoded = json_decode($raw, true);
+        if (is_array($decoded)) {
+            $urls = $decoded;
+        } else {
+            $urls = [$raw];
+        }
+    } elseif (is_array($raw)) {
+        $urls = $raw;
+    }
 
     $result = [];
-
-    foreach ($photos as $photo) {
-        $url = public_image_url($photo);
-        if ($url !== '' && !in_array($url, $result, true)) {
-            $result[] = $url;
+    foreach ($urls as $item) {
+        // Handle double-encoded JSON strings inside arrays
+        if (is_string($item) && (strpos($item, '[') === 0 || strpos($item, 'http') !== false)) {
+            $subDecoded = json_decode($item, true);
+            if (is_array($subDecoded)) {
+                foreach ($subDecoded as $subItem) {
+                    $formatted = public_image_url($subItem);
+                    if ($formatted !== '' && !in_array($formatted, $result, true)) {
+                        $result[] = $formatted;
+                    }
+                }
+                continue;
+            }
+        }
+        
+        $formatted = public_image_url($item);
+        if ($formatted !== '' && !in_array($formatted, $result, true)) {
+            $result[] = $formatted;
         }
     }
 
     return $result;
 }
 
-/*
- * process_project_images now mirrors blogs.php behavior but retains the
- * existing default behavior (adds uploads/default_project.jpg when empty).
- */
-function process_project_images($prefix, $existing_json = null) {
-    $photos = [];
 
-    if (!empty($existing_json)) {
-        $existing = json_decode($existing_json, true);
-        if (!is_array($existing)) $existing = [$existing_json];
+function process_project_images($existing_photos_json = null) {
+    $clean_photos = [];
 
-        foreach ($existing as $item) {
-            $item = trim((string)$item);
-            if ($item !== '' && !in_array($item, $photos, true)) {
-                $photos[] = $item;
-            }
-        }
-    }
-
-    /* Local uploaded files */
-    foreach (uploaded_images_array($prefix) as $path) {
-        if (!in_array($path, $photos, true)) $photos[] = $path;
-    }
-
-    /* External / input URLs */
-    $rawUrls = extract_image_urls_from_sources();
-
-    foreach ($rawUrls as $url) {
-        if (preg_match('#^https?://#i', $url) || strpos($url, 'data:image/') === 0) {
-            if (preg_match('#^https?://#i', $url)) {
-                [$ok, $savedPath] = download_external_image($url, $prefix);
-                if ($ok) {
-                    if (!in_array($savedPath, $photos, true)) $photos[] = $savedPath;
-                    continue;
+    if (!empty($existing_photos_json)) {
+        $existing = json_decode($existing_photos_json, true);
+        if (is_array($existing)) {
+            foreach ($existing as $ex_photo) {
+                $ex_photo = trim((string)$ex_photo);
+                if (!empty($ex_photo) && !in_array($ex_photo, $clean_photos, true)) {
+                    $clean_photos[] = $ex_photo;
                 }
             }
-            if (!in_array($url, $photos, true)) $photos[] = $url;
-        } else {
-            $path = normalize_stored_path($url);
-            if ($path !== '' && !in_array($path, $photos, true)) {
-                $photos[] = $path;
+        }
+    }
+
+    $uploaded = uploaded_images('project');
+    foreach ($uploaded as $upload) {
+        if (!in_array($upload, $clean_photos, true)) {
+            $clean_photos[] = $upload;
+        }
+    }
+
+    $input = json_decode(file_get_contents("php://input"), true);
+    if (!is_array($input)) {
+        $input = [];
+    }
+
+    $raw_photos = [];
+    $keys = [
+        'image_urls', 'image_urls[]', 'image_url',
+        'imageUrls', 'imageUrls[]', 'imageUrl',
+        'images', 'photos', 'photo', 'img_url', 'url', 'urls', 'media_url',
+        'external_urls', 'external_urls[]', 'external_url'
+    ];
+
+    $sources = [$_POST, $_GET, $input];
+    foreach ($sources as $source) {
+        foreach ($keys as $key) {
+            if (isset($source[$key])) {
+                $val = $source[$key];
+                if (is_array($val)) {
+                    $raw_photos = array_merge($raw_photos, $val);
+                } else if (is_string($val) && trim($val) !== '') {
+                    $decoded = json_decode($val, true);
+                    if (is_array($decoded)) {
+                        $raw_photos = array_merge($raw_photos, $decoded);
+                    } else {
+                        $parts = preg_split('/[\r\n,;]+/', $val);
+                        foreach ($parts as $part) {
+                            if (trim($part) !== '') $raw_photos[] = trim($part);
+                        }
+                    }
+                }
             }
         }
     }
 
-    if (empty($photos)) {
-        $photos[] = 'uploads/default_project.jpg';
-    }
+    foreach ($raw_photos as $img) {
+        $img = trim((string)$img);
+        if ($img === '') continue;
 
-    return json_encode(
-        array_values(array_unique($photos)),
-        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
-    );
-}
-
-function request_action() {
-    return strtolower(trim((string)($_REQUEST['action'] ?? '')));
-}
-
-function delete_stored_image($value) {
-    $items = json_decode((string)$value, true);
-    if (!is_array($items)) $items = [$value];
-
-    $root = realpath(__DIR__);
-    if (!$root) return;
-
-    foreach ($items as $item) {
-        $item = trim((string)$item);
-
-        if ($item === '' || preg_match('#^https?://#i', $item)) {
+        if (preg_match('#^https?://#i', $img) || strpos($img, 'data:image/') === 0) {
+            if (!in_array($img, $clean_photos, true)) {
+                $clean_photos[] = $img;
+            }
             continue;
         }
 
-        $path = normalize_stored_path($item);
+        $base = api_base_url();
+        if (strpos($img, $base) === 0) {
+            $img = substr($img, strlen($base));
+            $img = ltrim($img, '/');
+        }
 
-        if (stripos($path, 'uploads/') !== 0) continue;
+        $img = str_replace('\\', '/', $img);
+        $img = ltrim($img, '/');
 
-        $file = realpath(__DIR__ . DIRECTORY_SEPARATOR . $path);
+        $prefixes = ['bindu_decor/', 'api/bindu_decor/', 'uploads/uploads/'];
+        foreach ($prefixes as $prefix) {
+            if (stripos($img, $prefix) === 0) {
+                $img = substr($img, strlen($prefix));
+                break;
+            }
+        }
 
-        if ($file &&
-            str_starts_with($file, $root . DIRECTORY_SEPARATOR) &&
-            is_file($file)) {
-            @unlink($file);
+        if ($img !== '' && !in_array($img, $clean_photos, true)) {
+            $clean_photos[] = $img;
         }
     }
+
+    if (empty($clean_photos)) {
+        $clean_photos[] = 'uploads/default_project.jpg';
+    }
+
+    $clean_photos = array_slice(array_values(array_unique($clean_photos)), 0, 20);
+
+    return json_encode($clean_photos, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 }
 
 try {
-    $action = request_action();
+    $action = strtolower(trim((string)($_REQUEST['action'] ?? '')));
 
-    /* ========================= GET ========================= */
-    if ($_SERVER['REQUEST_METHOD'] === 'GET' &&
-        ($action === '' || in_array($action, ['fetch','get','list'], true))) {
-
+    if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($action === '' || in_array($action, ['fetch', 'get', 'list'], true))) {
         $rows = $pdo->query(
             "SELECT id, title, sub_title, location, pricing, bhk,
                     scope, property_type, size, description,
@@ -460,30 +323,23 @@ try {
 
         foreach ($rows as &$row) {
             $urls = resolve_photo_array($row['image_urls'] ?? '');
-
             $row['image_urls'] = $urls;
             $row['image_url']  = $urls[0] ?? '';
             $row['imageUrl']   = $urls[0] ?? '';
             $row['img_url']    = $urls[0] ?? '';
+            $row['image_count'] = count($urls);
         }
         unset($row);
 
         api_json('success', 'Projects fetched successfully', [
             'data' => $rows,
-            'projects' => $rows
+            'projects' => $rows,
+            'count' => count($rows)
         ]);
     }
 
-    /* ================= POST SAVE ================= */
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' &&
-        in_array($action, ['', 'add','create','save','publish','update'], true)) {
-
-        /*
-         * For multipart/form-data, $_POST contains the fields.
-         * For application/json, read php://input.
-         */
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && in_array($action, ['', 'add', 'create', 'save', 'publish', 'update'], true)) {
         $input = $_POST;
-
         if (empty($input)) {
             $json = json_decode(file_get_contents('php://input'), true);
             if (is_array($json)) $input = $json;
@@ -499,9 +355,7 @@ try {
         $existing_json = null;
 
         if ($id > 0) {
-            $stmt = $pdo->prepare(
-                "SELECT image_urls FROM projects WHERE id = :id"
-            );
+            $stmt = $pdo->prepare("SELECT image_urls FROM projects WHERE id = :id");
             $stmt->execute([':id' => $id]);
             $old = $stmt->fetch(PDO::FETCH_ASSOC);
 
@@ -510,7 +364,7 @@ try {
             }
         }
 
-        $image_json = process_project_images('project', $existing_json);
+        $image_json = process_project_images($existing_json);
 
         $fields = [
             'sub_title'     => trim((string)($input['sub_title'] ?? $input['subTitle'] ?? 'Featured Residence')),
@@ -557,11 +411,9 @@ try {
         } else {
             $stmt = $pdo->prepare(
                 "INSERT INTO projects
-                (title, sub_title, location, pricing, bhk, scope,
-                 property_type, size, description, image_urls)
+                (title, sub_title, location, pricing, bhk, scope, property_type, size, description, image_urls)
                  VALUES
-                (:title, :sub_title, :location, :pricing, :bhk, :scope,
-                 :property_type, :size, :description, :image_urls)"
+                (:title, :sub_title, :location, :pricing, :bhk, :scope, :property_type, :size, :description, :image_urls)"
             );
 
             $stmt->execute([
@@ -582,9 +434,7 @@ try {
         }
 
         $stmt = $pdo->prepare(
-            "SELECT id, title, sub_title, location, pricing, bhk,
-                    scope, property_type, size, description,
-                    image_urls, created_at
+            "SELECT id, title, sub_title, location, pricing, bhk, scope, property_type, size, description, image_urls, created_at
              FROM projects WHERE id = :id"
         );
         $stmt->execute([':id' => $id]);
@@ -597,44 +447,29 @@ try {
             $project['image_url'] = $urls[0] ?? '';
             $project['imageUrl'] = $urls[0] ?? '';
             $project['img_url'] = $urls[0] ?? '';
+            $project['image_count'] = count($urls);
         }
-
-        $urls = resolve_photo_array($image_json);
 
         api_json('success', $message, [
             'id' => $id,
-            'image_urls' => $urls,
-            'image_url' => $urls[0] ?? '',
-            'data' => $project
+            'data' => $project,
+            'image_urls' => $urls ?? [],
+            'image_url' => ($urls[0] ?? ''),
+            'image_count' => count($urls ?? [])
         ]);
     }
 
-    /* ================= DELETE ================= */
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && $action === 'delete') {
-
         $id = (int)($_POST['id'] ?? $_GET['id'] ?? 0);
-
         if ($id <= 0) {
             api_json('error', 'Valid project ID is required.', [], 422);
         }
 
-        $stmt = $pdo->prepare(
-            "SELECT image_urls FROM projects WHERE id = :id"
-        );
-        $stmt->execute([':id' => $id]);
-        $old = $stmt->fetch(PDO::FETCH_ASSOC);
-
-        $stmt = $pdo->prepare(
-            "DELETE FROM projects WHERE id = :id"
-        );
+        $stmt = $pdo->prepare("DELETE FROM projects WHERE id = :id");
         $stmt->execute([':id' => $id]);
 
         if (!$stmt->rowCount()) {
             api_json('error', 'Project not found.', [], 404);
-        }
-
-        if ($old) {
-            delete_stored_image($old['image_urls'] ?? '');
         }
 
         api_json('success', 'Project deleted successfully');
@@ -643,6 +478,7 @@ try {
     api_json('error', 'Invalid or missing action.', [], 400);
 
 } catch (Throwable $e) {
-    api_json('error', 'Server error: ' . $e->getMessage(), [], 500);
+    error_log('Projects API Error: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
+    api_json('error', 'Server error occurred.', [], 500);
 }
 ?>

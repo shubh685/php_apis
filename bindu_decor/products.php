@@ -2,7 +2,7 @@
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Headers: Content-Type, X-Requested-With");
 header("Access-Control-Allow-Methods: POST, GET, OPTIONS");
-header("Content-Type: application/json");
+header("Content-Type: application/json; charset=UTF-8");
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     http_response_code(200);
@@ -10,6 +10,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 }
 
 require_once __DIR__ . '/database.php';
+
+ini_set('display_errors', 1);
+ini_set('log_errors', 1);
+ini_set('error_log', __DIR__ . '/error_log.txt');
 
 function api_json($status, $message = '', $data = [], $code = 200) {
     http_response_code($code);
@@ -23,7 +27,8 @@ function api_json($status, $message = '', $data = [], $code = 200) {
 function api_base_url() {
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     $script = $_SERVER['SCRIPT_NAME'] ?? '';
-    $directory = trim(str_replace('\\', '/', dirname($script)), '/');
+    $directory = str_replace('\\', '/', dirname($script));
+    $directory = trim($directory, '/');
 
     $is_https = (
         (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ||
@@ -72,9 +77,7 @@ function image_ext($mime, $name = '') {
     $ext = strtolower(pathinfo($name, PATHINFO_EXTENSION));
     if ($ext === 'jpeg') $ext = 'jpg';
 
-    return in_array($ext, ['jpg','png','webp','gif','bmp','avif'], true)
-        ? $ext
-        : 'jpg';
+    return in_array($ext, ['jpg','png','webp','gif','bmp','avif'], true) ? $ext : 'jpg';
 }
 
 function valid_image($path) {
@@ -101,8 +104,7 @@ function valid_image($path) {
 }
 
 function unique_image_name($prefix, $ext) {
-    return $prefix . '_' . date('Ymd_His') . '_' .
-        bin2hex(random_bytes(8)) . '.' . $ext;
+    return $prefix . '_' . date('Ymd_His') . '_' . bin2hex(random_bytes(8)) . '.' . $ext;
 }
 
 function save_uploaded($file, $prefix) {
@@ -133,7 +135,7 @@ function save_uploaded($file, $prefix) {
 
 function uploaded_images_array($prefix) {
     $saved = [];
-    $fields = ['images','files','photos','imageFile','image','image_file','file','media','photo'];
+    $fields = ['image_urls', 'image_urls[]', 'image_url', 'imageUrls', 'imageUrls[]', 'imageUrl', 'images', 'photos', 'photo', 'img_url', 'file', 'files', 'media'];
 
     foreach ($fields as $field) {
         if (!isset($_FILES[$field])) continue;
@@ -164,10 +166,8 @@ function uploaded_images_array($prefix) {
     return $saved;
 }
 
-/* --- New: robust multiple-URL extraction similar to blogs.php --- */
 function extract_image_urls_from_sources() {
     $result = [];
-
     $keys = [
         'image_urls','image_urls[]','image_url',
         'imageUrls','imageUrls[]','imageUrl',
@@ -194,7 +194,6 @@ function extract_image_urls_from_sources() {
                 if ($value === '') continue;
 
                 $decoded = json_decode($value, true);
-
                 if (is_array($decoded)) {
                     foreach ($decoded as $item) {
                         if (is_string($item) && trim($item) !== '') {
@@ -216,142 +215,66 @@ function extract_image_urls_from_sources() {
     return array_values(array_unique($result));
 }
 
-/* Keep downloading helper as before */
-function download_external_image($url, $prefix) {
-    $url = trim($url);
-
-    if (!preg_match('#^https?://#i', $url)) {
-        return [false, 'Only HTTP/HTTPS image URLs are supported.'];
-    }
-
-    if (!function_exists('curl_init')) {
-        return [false, 'PHP cURL extension is not enabled.'];
-    }
-
-    $ch = curl_init($url);
-
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_FOLLOWLOCATION => true,
-        CURLOPT_MAXREDIRS => 5,
-        CURLOPT_CONNECTTIMEOUT => 15,
-        CURLOPT_TIMEOUT => 45,
-        CURLOPT_USERAGENT => 'Mozilla/5.0',
-        CURLOPT_SSL_VERIFYPEER => true,
-        CURLOPT_SSL_VERIFYHOST => 2,
-        CURLOPT_HTTPHEADER => [
-            'Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
-        ]
-    ]);
-
-    $body = curl_exec($ch);
-    $http = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-    $error = curl_error($ch);
-    curl_close($ch);
-
-    if ($body === false || $http < 200 || $http >= 400) {
-        return [false, 'Unable to download image. HTTP ' . $http . ($error ? ': ' . $error : '')];
-    }
-
-    $tmp = tempnam(sys_get_temp_dir(), 'img_');
-
-    if ($tmp === false || file_put_contents($tmp, $body) === false) {
-        @unlink($tmp);
-        return [false, 'Unable to create temporary image file.'];
-    }
-
-    [$ok, $mime] = valid_image($tmp);
-
-    if (!$ok) {
-        @unlink($tmp);
-        return [false, 'Remote URL did not return a valid image.'];
-    }
-
-    $ext = image_ext($mime, parse_url($url, PHP_URL_PATH) ?? '');
-    $name = unique_image_name($prefix, $ext);
-    $dest = uploads_dir() . $name;
-
-    if (!rename($tmp, $dest)) {
-        if (!copy($tmp, $dest)) {
-            @unlink($tmp);
-            return [false, 'Unable to save downloaded image.'];
-        }
-        @unlink($tmp);
-    }
-
-    @chmod($dest, 0644);
-
-    return [true, 'uploads/' . $name];
-}
-
-/* normalize_stored_path reused (keeps your previous normalization behavior) */
-function normalize_stored_path($value) {
-    $value = trim((string)$value);
-    if ($value === '') return '';
-
-    if (preg_match('#^https?://#i', $value)) return $value;
-
-    $base = rtrim(api_base_url(), '/');
-
-    if (stripos($value, $base . '/') === 0) {
-        $value = substr($value, strlen($base) + 1);
-    }
-
-    $value = ltrim(str_replace('\\', '/', $value), '/');
-
-    foreach (['bindu_decor/','api/bindu_decor/','uploads/uploads/'] as $prefix) {
-        if (stripos($value, $prefix) === 0) {
-            $value = substr($value, strlen($prefix));
-            break;
-        }
-    }
-
-    if (stripos($value, 'uploads/') !== 0 &&
-        stripos($value, 'image.php') !== 0) {
-        $value = 'uploads/' . $value;
-    }
-
-    return $value;
-}
-
-/* public_image_url: follow blogs.php style — return direct /uploads/... URL (or data/http unchanged) */
 function public_image_url($value) {
     $value = trim((string)$value);
-    if ($value === '') return '';
+    if ($value === '' || $value === 'null' || $value === 'undefined') return '';
 
-    if (preg_match('#^https?://#i', $value) ||
-        strpos($value, 'data:image/') === 0) {
+    // If it's already a valid absolute URL or data URI, return it clean without rawurlencode!
+    if (preg_match('#^https?://#i', $value) || strpos($value, 'data:image/') === 0) {
         return $value;
     }
 
-    $value = ltrim(str_replace('\\', '/', $value), '/');
+    $value = str_replace('\\', '/', $value);
+    $value = ltrim($value, '/');
 
-    foreach (['bindu_decor/','api/bindu_decor/','uploads/uploads/'] as $prefix) {
+    $prefixes = ['bindu_decor/', 'api/bindu_decor/', 'uploads/uploads/'];
+    foreach ($prefixes as $prefix) {
         if (stripos($value, $prefix) === 0) {
             $value = substr($value, strlen($prefix));
             break;
         }
     }
 
-    if (stripos($value, 'uploads/') !== 0 &&
-        stripos($value, 'image.php') !== 0) {
+    if (stripos($value, 'uploads/') !== 0 && stripos($value, 'image.php') !== 0) {
         $value = 'uploads/' . $value;
     }
 
-    return rtrim(api_base_url(), '/') . '/' . ltrim($value, '/');
+    return rtrim(api_base_url(), '/') . '/' . $value;
 }
+
 
 function resolve_image_urls($raw) {
     if (empty($raw)) return [];
 
-    $urls = json_decode($raw, true);
-    if (!is_array($urls)) $urls = [$raw];
+    $urls = [];
+    if (is_string($raw)) {
+        $decoded = json_decode($raw, true);
+        if (is_array($decoded)) {
+            $urls = $decoded;
+        } else {
+            $urls = [$raw];
+        }
+    } elseif (is_array($raw)) {
+        $urls = $raw;
+    }
 
     $result = [];
-
-    foreach ($urls as $url) {
-        $formatted = public_image_url($url);
-
+    foreach ($urls as $item) {
+        // Handle double-encoded JSON strings inside arrays
+        if (is_string($item) && (strpos($item, '[') === 0 || strpos($item, 'http') !== false)) {
+            $subDecoded = json_decode($item, true);
+            if (is_array($subDecoded)) {
+                foreach ($subDecoded as $subItem) {
+                    $formatted = public_image_url($subItem);
+                    if ($formatted !== '' && !in_array($formatted, $result, true)) {
+                        $result[] = $formatted;
+                    }
+                }
+                continue;
+            }
+        }
+        
+        $formatted = public_image_url($item);
         if ($formatted !== '' && !in_array($formatted, $result, true)) {
             $result[] = $formatted;
         }
@@ -360,20 +283,14 @@ function resolve_image_urls($raw) {
     return $result;
 }
 
-/*
- * New process_multiple_images adapted from blogs.php behavior:
- * - preserve existing DB values
- * - save uploaded files
- * - accept multiple URLs from many fields / formats
- * - download external images when possible
- */
 function process_multiple_images($prefix, $existing_json = null) {
     $photos = [];
 
-    /* Preserve existing DB images */
     if (!empty($existing_json)) {
         $existing = json_decode($existing_json, true);
-        if (!is_array($existing)) $existing = [$existing_json];
+        if (!is_array($existing)) {
+            $existing = [$existing_json];
+        }
 
         foreach ($existing as $item) {
             $item = trim((string)$item);
@@ -383,108 +300,80 @@ function process_multiple_images($prefix, $existing_json = null) {
         }
     }
 
-    /* Save uploaded local files */
     foreach (uploaded_images_array($prefix) as $path) {
         if (!in_array($path, $photos, true)) {
             $photos[] = $path;
         }
     }
 
-    /* Extract multiple external or relative URLs from input */
     $rawUrls = extract_image_urls_from_sources();
 
     foreach ($rawUrls as $url) {
+        $url = trim($url);
+        if ($url === '') continue;
+
         if (preg_match('#^https?://#i', $url) || strpos($url, 'data:image/') === 0) {
-            // Try to download external HTTPS links to store locally when possible
-            if (preg_match('#^https?://#i', $url)) {
-                [$ok, $saved] = download_external_image($url, $prefix);
-                if ($ok) {
-                    if (!in_array($saved, $photos, true)) $photos[] = $saved;
-                    continue;
-                }
-                // if download failed, preserve the remote URL itself
+            if (!in_array($url, $photos, true)) {
+                $photos[] = $url;
             }
-            if (!in_array($url, $photos, true)) $photos[] = $url;
-        } else {
-            // Treat as a local/relative path — normalize and save as uploads/...
-            $path = normalize_stored_path($url);
-            if ($path !== '' && !in_array($path, $photos, true)) {
-                $photos[] = $path;
-            }
-        }
-    }
-
-    return json_encode(
-        array_values(array_unique($photos)),
-        JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
-    );
-}
-
-/* delete_stored_image unchanged */
-function delete_stored_image($value) {
-    $items = json_decode((string)$value, true);
-    if (!is_array($items)) $items = [$value];
-
-    $root = realpath(__DIR__);
-    if (!$root) return;
-
-    foreach ($items as $item) {
-        $item = trim((string)$item);
-
-        if ($item === '' || preg_match('#^https?://#i', $item)) {
             continue;
         }
 
-        $path = normalize_stored_path($item);
+        $base = api_base_url();
+        if (strpos($url, $base) === 0) {
+            $url = substr($url, strlen($base));
+            $url = ltrim($url, '/');
+        }
 
-        if (stripos($path, 'uploads/') !== 0) continue;
+        $url = str_replace('\\', '/', $url);
+        $url = ltrim($url, '/');
 
-        $file = realpath(__DIR__ . DIRECTORY_SEPARATOR . $path);
+        $prefixes = ['bindu_decor/', 'api/bindu_decor/', 'uploads/uploads/'];
+        foreach ($prefixes as $p) {
+            if (stripos($url, $p) === 0) {
+                $url = substr($url, strlen($p));
+                break;
+            }
+        }
 
-        if ($file &&
-            str_starts_with($file, $root . DIRECTORY_SEPARATOR) &&
-            is_file($file)) {
-            @unlink($file);
+        if ($url !== '' && !in_array($url, $photos, true)) {
+            $photos[] = $url;
         }
     }
+
+    $photos = array_slice(array_values(array_unique($photos)), 0, 20);
+
+    return json_encode($photos, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 }
 
 try {
     $action = strtolower(trim((string)($_REQUEST['action'] ?? '')));
 
-    /* ========================= GET ========================= */
-    if ($_SERVER['REQUEST_METHOD'] === 'GET' &&
-        ($action === '' || in_array($action, ['fetch','get','list'], true))) {
-
+    if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($action === '' || in_array($action, ['fetch','get','list'], true))) {
         $rows = $pdo->query(
-            "SELECT id, title, category, image_url,
-                    description, material, print_type, created_at
-             FROM products
-             ORDER BY id DESC"
+            "SELECT id, title, category, image_urls, description, material, print_type, created_at
+             FROM products ORDER BY id DESC"
         )->fetchAll(PDO::FETCH_ASSOC);
 
         foreach ($rows as &$row) {
-            $urls = resolve_image_urls($row['image_url'] ?? '');
-
+            $urls = resolve_image_urls($row['image_urls'] ?? '');
             $row['image_urls'] = $urls;
             $row['image_url']  = $urls[0] ?? '';
             $row['imageUrl']   = $urls[0] ?? '';
             $row['img_url']    = $urls[0] ?? '';
+            $row['image_count'] = count($urls);
         }
         unset($row);
 
         api_json('success', 'Products fetched successfully', [
             'data' => $rows,
-            'products' => $rows
+            'products' => $rows,
+            'count' => count($rows)
         ]);
     }
 
-    /* ========================= SAVE ========================= */
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' &&
-        in_array($action, ['', 'add','create','save','publish','update'], true)) {
-
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && in_array($action, ['', 'add','create','save','publish','update'], true)) {
         $input = $_POST;
-
         if (empty($input)) {
             $json = json_decode(file_get_contents('php://input'), true);
             if (is_array($json)) $input = $json;
@@ -498,39 +387,29 @@ try {
         }
 
         $existing_json = null;
-
         if ($id > 0) {
-            $stmt = $pdo->prepare(
-                "SELECT image_url FROM products WHERE id = :id"
-            );
+            $stmt = $pdo->prepare("SELECT image_urls FROM products WHERE id = :id");
             $stmt->execute([':id' => $id]);
             $old = $stmt->fetch(PDO::FETCH_ASSOC);
 
             if ($old) {
-                $existing_json = $old['image_url'] ?? null;
+                $existing_json = $old['image_urls'] ?? null;
             }
         }
 
-        $image_json = process_multiple_images(
-            'product',
-            $existing_json
-        );
+        $image_json = process_multiple_images('product', $existing_json);
 
         $category = trim((string)($input['category'] ?? 'HOME DECOR'));
         $description = trim((string)($input['description'] ?? 'High-quality decor item.'));
         $material = trim((string)($input['material'] ?? 'Premium Grade Material'));
-        $print = trim((string)(
-            $input['print_type'] ??
-            $input['printType'] ??
-            'High Definition Digital Print / Finish'
-        ));
+        $print = trim((string)($input['print_type'] ?? $input['printType'] ?? 'High Definition Digital Print / Finish'));
 
         if ($id > 0) {
             $stmt = $pdo->prepare(
                 "UPDATE products SET
                     title = :title,
                     category = :category,
-                    image_url = :image_url,
+                    image_urls = :image_urls,
                     description = :description,
                     material = :material,
                     print_type = :print_type
@@ -540,7 +419,7 @@ try {
             $stmt->execute([
                 ':title' => $title,
                 ':category' => $category,
-                ':image_url' => $image_json,
+                ':image_urls' => $image_json,
                 ':description' => $description,
                 ':material' => $material,
                 ':print_type' => $print,
@@ -551,15 +430,15 @@ try {
         } else {
             $stmt = $pdo->prepare(
                 "INSERT INTO products
-                (title, category, image_url, description, material, print_type)
+                (title, category, image_urls, description, material, print_type)
                 VALUES
-                (:title, :category, :image_url, :description, :material, :print_type)"
+                (:title, :category, :image_urls, :description, :material, :print_type)"
             );
 
             $stmt->execute([
                 ':title' => $title,
                 ':category' => $category,
-                ':image_url' => $image_json,
+                ':image_urls' => $image_json,
                 ':description' => $description,
                 ':material' => $material,
                 ':print_type' => $print
@@ -569,56 +448,42 @@ try {
             $message = 'Product saved successfully';
         }
 
-        $urls = resolve_image_urls($image_json);
+        $stmt = $pdo->prepare(
+            "SELECT id, title, category, image_urls, description, material, print_type, created_at
+             FROM products WHERE id = :id"
+        );
+        $stmt->execute([':id' => $id]);
+        $product = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($product) {
+            $urls = resolve_image_urls($product['image_urls'] ?? '');
+            $product['image_urls'] = $urls;
+            $product['image_url'] = $urls[0] ?? '';
+            $product['imageUrl'] = $urls[0] ?? '';
+            $product['img_url'] = $urls[0] ?? '';
+            $product['image_count'] = count($urls);
+        }
 
         api_json('success', $message, [
             'id' => $id,
-            'image_urls' => $urls,
-            'image_url' => $urls[0] ?? '',
-            'imageUrl' => $urls[0] ?? '',
-            'img_url' => $urls[0] ?? '',
-            'data' => [
-                'id' => $id,
-                'title' => $title,
-                'category' => $category,
-                'image_urls' => $urls,
-                'image_url' => $urls[0] ?? '',
-                'imageUrl' => $urls[0] ?? '',
-                'img_url' => $urls[0] ?? '',
-                'description' => $description,
-                'material' => $material,
-                'print_type' => $print
-            ]
+            'data' => $product,
+            'image_urls' => $urls ?? [],
+            'image_url' => ($urls[0] ?? ''),
+            'image_count' => count($urls ?? [])
         ]);
     }
 
-    /* ========================= DELETE ========================= */
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' &&
-        $action === 'delete') {
-
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && $action === 'delete') {
         $id = (int)($_POST['id'] ?? $_GET['id'] ?? 0);
-
         if ($id <= 0) {
             api_json('error', 'Valid product ID is required.', [], 422);
         }
 
-        $stmt = $pdo->prepare(
-            "SELECT image_url FROM products WHERE id = :id"
-        );
-        $stmt->execute([':id' => $id]);
-        $old = $stmt->fetch(PDO::FETCH_ASSOC);
-
-        $stmt = $pdo->prepare(
-            "DELETE FROM products WHERE id = :id"
-        );
+        $stmt = $pdo->prepare("DELETE FROM products WHERE id = :id");
         $stmt->execute([':id' => $id]);
 
         if (!$stmt->rowCount()) {
             api_json('error', 'Product not found.', [], 404);
-        }
-
-        if ($old) {
-            delete_stored_image($old['image_url'] ?? '');
         }
 
         api_json('success', 'Product deleted successfully');
@@ -627,6 +492,7 @@ try {
     api_json('error', 'Invalid or missing action.', [], 400);
 
 } catch (Throwable $e) {
+    error_log('Products API Error: ' . $e->getMessage() . ' in ' . $e->getFile() . ':' . $e->getLine());
     api_json('error', 'Server error: ' . $e->getMessage(), [], 500);
 }
 ?>
