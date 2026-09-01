@@ -215,18 +215,34 @@ function extract_image_urls_from_sources() {
     return array_values(array_unique($result));
 }
 
+// ================================================================
+// UPDATED: public_image_url - FIXED for external URLs
+// ================================================================
 function public_image_url($value) {
     $value = trim((string)$value);
     if ($value === '' || $value === 'null' || $value === 'undefined') return '';
 
-    // If it's already a valid absolute URL or data URI, return it directly
-    if (preg_match('#^https?://#i', $value) || strpos($value, 'data:image/') === 0) {
+    // ============================================================
+    // 1. EXTERNAL HTTPS/HTTP URL - return as is (absolute)
+    // ============================================================
+    if (preg_match('#^https?://#i', $value)) {
         return $value;
     }
 
+    // ============================================================
+    // 2. DATA URI - return as is
+    // ============================================================
+    if (strpos($value, 'data:image/') === 0) {
+        return $value;
+    }
+
+    // ============================================================
+    // 3. LOCAL PATH - build absolute URL using image.php proxy
+    // ============================================================
     $value = str_replace('\\', '/', $value);
     $value = ltrim($value, '/');
 
+    // Remove duplicate prefixes
     $prefixes = ['bindu_decor/', 'api/bindu_decor/', 'uploads/uploads/'];
     foreach ($prefixes as $prefix) {
         if (stripos($value, $prefix) === 0) {
@@ -235,55 +251,88 @@ function public_image_url($value) {
         }
     }
 
+    // Ensure it starts with uploads/
     if (stripos($value, 'uploads/') !== 0 && stripos($value, 'image.php') !== 0) {
         $value = 'uploads/' . $value;
     }
 
-    return rtrim(api_base_url(), '/') . '/' . $value;
+    // If it's already an image.php path, just add base URL
+    if (stripos($value, 'image.php') === 0) {
+        return rtrim(api_base_url(), '/') . '/' . $value;
+    }
+
+    // Otherwise, route through image.php for secure delivery
+    $base = rtrim(api_base_url(), '/');
+    return $base . '/image.php?path=' . rawurlencode($value);
 }
 
+// ================================================================
+// UPDATED: resolve_image_urls - FIXED for arrays and external URLs
+// ================================================================
 function resolve_image_urls($raw) {
     if (empty($raw)) return [];
 
     $urls = [];
+    
+    // If it's a string, try to decode JSON or treat as single URL
     if (is_string($raw)) {
-        $decoded = json_decode($raw, true);
+        $trimmed = trim($raw);
+        if (empty($trimmed)) return [];
+        
+        // Try to decode JSON
+        $decoded = json_decode($trimmed, true);
         if (is_array($decoded)) {
             $urls = $decoded;
         } else {
-            $urls = [$raw];
+            // Check if it's a comma-separated list
+            if (strpos($trimmed, ',') !== false) {
+                $urls = array_map('trim', explode(',', $trimmed));
+            } else {
+                $urls = [$trimmed];
+            }
         }
     } elseif (is_array($raw)) {
         $urls = $raw;
     }
 
+    // Process each URL
     $result = [];
     foreach ($urls as $item) {
-        if (is_string($item) && (strpos($item, '[') === 0 || strpos($item, 'http') !== false)) {
-            $subDecoded = json_decode($item, true);
-            if (is_array($subDecoded)) {
-                foreach ($subDecoded as $subItem) {
-                    $formatted = public_image_url($subItem);
-                    if ($formatted !== '' && !in_array($formatted, $result, true)) {
-                        $result[] = $formatted;
+        if (is_string($item) && trim($item) !== '') {
+            $item = trim($item);
+            
+            // If it's a JSON-encoded array inside the string
+            if (strpos($item, '[') === 0 || strpos($item, '{') === 0) {
+                $subDecoded = json_decode($item, true);
+                if (is_array($subDecoded)) {
+                    foreach ($subDecoded as $subItem) {
+                        $formatted = public_image_url($subItem);
+                        if ($formatted !== '' && !in_array($formatted, $result, true)) {
+                            $result[] = $formatted;
+                        }
                     }
+                    continue;
                 }
-                continue;
             }
-        }
-
-        $formatted = public_image_url($item);
-        if ($formatted !== '' && !in_array($formatted, $result, true)) {
-            $result[] = $formatted;
+            
+            // Normal URL
+            $formatted = public_image_url($item);
+            if ($formatted !== '' && !in_array($formatted, $result, true)) {
+                $result[] = $formatted;
+            }
         }
     }
 
     return array_values(array_unique($result));
 }
 
+// ================================================================
+// UPDATED: process_multiple_images - preserves all image URLs
+// ================================================================
 function process_multiple_images($prefix, $existing_json = null) {
     $photos = [];
 
+    // 1. Preserve existing images from database
     if (!empty($existing_json)) {
         $existing = json_decode($existing_json, true);
         if (!is_array($existing)) {
@@ -298,18 +347,21 @@ function process_multiple_images($prefix, $existing_json = null) {
         }
     }
 
+    // 2. Add newly uploaded images
     foreach (uploaded_images_array($prefix) as $path) {
         if (!in_array($path, $photos, true)) {
             $photos[] = $path;
         }
     }
 
+    // 3. Extract URLs from various sources (POST, GET, JSON body)
     $rawUrls = extract_image_urls_from_sources();
 
     foreach ($rawUrls as $url) {
         $url = trim($url);
         if ($url === '') continue;
 
+        // If it's an external URL or data URI, add directly
         if (preg_match('#^https?://#i', $url) || strpos($url, 'data:image/') === 0) {
             if (!in_array($url, $photos, true)) {
                 $photos[] = $url;
@@ -317,6 +369,7 @@ function process_multiple_images($prefix, $existing_json = null) {
             continue;
         }
 
+        // Clean local path
         $base = api_base_url();
         if (strpos($url, $base) === 0) {
             $url = substr($url, strlen($base));
@@ -339,6 +392,7 @@ function process_multiple_images($prefix, $existing_json = null) {
         }
     }
 
+    // Limit to 20 images
     $photos = array_slice(array_values(array_unique($photos)), 0, 20);
 
     return json_encode($photos, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
@@ -443,7 +497,7 @@ try {
         
         if (!empty($category)) {
             $normalizedCategory = normalize_category($category);
-            $sql .= " WHERE UPPER(TRIM(category)) = :category";
+            $sql .= " WHERE LOWER(TRIM(category)) = LOWER(:category)";
             $params[':category'] = $normalizedCategory;
         } elseif (isset($_REQUEST['category_id'])) {
             $sql .= " WHERE id = :category_id";
@@ -481,7 +535,7 @@ try {
         $countSql = "SELECT COUNT(*) as total FROM products";
         $countParams = [];
         if (!empty($category)) {
-            $countSql .= " WHERE UPPER(TRIM(category)) = :category";
+            $countSql .= " WHERE LOWER(TRIM(category)) = LOWER(:category)";
             $countParams[':category'] = normalize_category($category);
         } elseif (isset($_REQUEST['search'])) {
             $search = '%' . trim((string)$_REQUEST['search']) . '%';
