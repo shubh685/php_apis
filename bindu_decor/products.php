@@ -219,7 +219,7 @@ function public_image_url($value) {
     $value = trim((string)$value);
     if ($value === '' || $value === 'null' || $value === 'undefined') return '';
 
-    // If it's already a valid absolute URL or data URI, return it clean without rawurlencode!
+    // If it's already a valid absolute URL or data URI, return it directly
     if (preg_match('#^https?://#i', $value) || strpos($value, 'data:image/') === 0) {
         return $value;
     }
@@ -242,7 +242,6 @@ function public_image_url($value) {
     return rtrim(api_base_url(), '/') . '/' . $value;
 }
 
-
 function resolve_image_urls($raw) {
     if (empty($raw)) return [];
 
@@ -260,7 +259,6 @@ function resolve_image_urls($raw) {
 
     $result = [];
     foreach ($urls as $item) {
-        // Handle double-encoded JSON strings inside arrays
         if (is_string($item) && (strpos($item, '[') === 0 || strpos($item, 'http') !== false)) {
             $subDecoded = json_decode($item, true);
             if (is_array($subDecoded)) {
@@ -273,14 +271,14 @@ function resolve_image_urls($raw) {
                 continue;
             }
         }
-        
+
         $formatted = public_image_url($item);
         if ($formatted !== '' && !in_array($formatted, $result, true)) {
             $result[] = $formatted;
         }
     }
 
-    return $result;
+    return array_values(array_unique($result));
 }
 
 function process_multiple_images($prefix, $existing_json = null) {
@@ -346,14 +344,156 @@ function process_multiple_images($prefix, $existing_json = null) {
     return json_encode($photos, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
 }
 
+function normalize_category($category) {
+    if (empty($category)) return 'HOME DECOR';
+    
+    $category = trim((string)$category);
+    
+    // Map display names to database category names (exact match)
+    $map = [
+        'WALLPAPERS' => 'Wallpapers',
+        'WALLPAPER' => 'Wallpapers',
+        'WALL' => 'Wallpapers',
+        'WALL DECOR' => 'Wallpapers',
+        
+        'FLOORINGS' => 'Floorings',
+        'FLOORING' => 'Floorings',
+        'FLOOR' => 'Floorings',
+        
+        'CARPETS' => 'Carpets',
+        'CARPET' => 'Carpets',
+        
+        'BLINDS' => 'Blinds',
+        'BLIND' => 'Blinds',
+        'WINDOW' => 'Blinds',
+        'WINDOW DECOR' => 'Blinds',
+        
+        'GLASS FILMS' => 'Glass Films',
+        'GLASS FILM' => 'Glass Films',
+        'GLASS' => 'Glass Films',
+        
+        'ARTIFICIAL TURFS' => 'Artificial Turfs',
+        'ARTIFICIAL TURF' => 'Artificial Turfs',
+        'TURF' => 'Artificial Turfs',
+        
+        'GYM FLOORINGS' => 'Gym Floorings',
+        'GYM FLOORING' => 'Gym Floorings',
+        'GYM' => 'Gym Floorings',
+        
+        'AWNINGS' => 'Awnings',
+        'AWNING' => 'Awnings',
+        
+        'MOSQUITO NETS' => 'Mosquito Nets',
+        'MOSQUITO NET' => 'Mosquito Nets',
+        'MOSQUITO' => 'Mosquito Nets',
+        
+        'UPHOLSTERY' => 'Upholstery',
+        
+        'CURTAINS' => 'Curtains',
+        'CURTAIN' => 'Curtains',
+        
+        'STRETCH CEILING' => 'Stretch Ceiling',
+        'CEILING' => 'Stretch Ceiling',
+        
+        'HOME DECOR' => 'Home Decor',
+        'HOME' => 'Home Decor',
+        'DECOR' => 'Home Decor',
+        'DECORATIVE' => 'Home Decor',
+    ];
+    
+    $upper = strtoupper($category);
+    return $map[$upper] ?? $category;
+}
+
+function get_category_counts($pdo) {
+    try {
+        $stmt = $pdo->query(
+            "SELECT category, COUNT(*) as count 
+             FROM products 
+             GROUP BY category 
+             ORDER BY category ASC"
+        );
+        return $stmt->fetchAll(PDO::FETCH_ASSOC);
+    } catch (PDOException $e) {
+        return [];
+    }
+}
+
 try {
     $action = strtolower(trim((string)($_REQUEST['action'] ?? '')));
+    $category = isset($_REQUEST['category']) ? trim((string)$_REQUEST['category']) : null;
+    $limit = isset($_REQUEST['limit']) ? (int)$_REQUEST['limit'] : 0;
+    $offset = isset($_REQUEST['offset']) ? (int)$_REQUEST['offset'] : 0;
 
-    if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($action === '' || in_array($action, ['fetch','get','list'], true))) {
-        $rows = $pdo->query(
-            "SELECT id, title, category, image_urls, description, material, print_type, created_at
-             FROM products ORDER BY id DESC"
-        )->fetchAll(PDO::FETCH_ASSOC);
+    // ================================================================
+    // FETCH PRODUCTS (GET)
+    // ================================================================
+    if ($_SERVER['REQUEST_METHOD'] === 'GET' && ($action === '' || in_array($action, ['fetch','get','list','categories'], true))) {
+        
+        if ($action === 'categories') {
+            $categories = get_category_counts($pdo);
+            api_json('success', 'Categories fetched successfully', [
+                'categories' => $categories,
+                'count' => count($categories)
+            ]);
+        }
+        
+        $sql = "SELECT id, title, category, image_urls, description, material, print_type, created_at FROM products";
+        $params = [];
+        
+        if (!empty($category)) {
+            $normalizedCategory = normalize_category($category);
+            $sql .= " WHERE UPPER(TRIM(category)) = :category";
+            $params[':category'] = $normalizedCategory;
+        } elseif (isset($_REQUEST['category_id'])) {
+            $sql .= " WHERE id = :category_id";
+            $params[':category_id'] = (int)$_REQUEST['category_id'];
+        } elseif (isset($_REQUEST['search'])) {
+            $search = '%' . trim((string)$_REQUEST['search']) . '%';
+            $sql .= " WHERE title LIKE :search OR description LIKE :search OR category LIKE :search";
+            $params[':search'] = $search;
+        }
+        
+        $sql .= " ORDER BY id DESC";
+        
+        if ($limit > 0) {
+            $sql .= " LIMIT :limit";
+            $params[':limit'] = $limit;
+            if ($offset > 0) {
+                $sql .= " OFFSET :offset";
+                $params[':offset'] = $offset;
+            }
+        }
+        
+        $stmt = $pdo->prepare($sql);
+        
+        foreach ($params as $key => $value) {
+            if ($key === ':limit' || $key === ':offset') {
+                $stmt->bindValue($key, $value, PDO::PARAM_INT);
+            } else {
+                $stmt->bindValue($key, $value);
+            }
+        }
+        
+        $stmt->execute();
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+        $countSql = "SELECT COUNT(*) as total FROM products";
+        $countParams = [];
+        if (!empty($category)) {
+            $countSql .= " WHERE UPPER(TRIM(category)) = :category";
+            $countParams[':category'] = normalize_category($category);
+        } elseif (isset($_REQUEST['search'])) {
+            $search = '%' . trim((string)$_REQUEST['search']) . '%';
+            $countSql .= " WHERE title LIKE :search OR description LIKE :search OR category LIKE :search";
+            $countParams[':search'] = $search;
+        }
+        $countStmt = $pdo->prepare($countSql);
+        foreach ($countParams as $key => $value) {
+            $countStmt->bindValue($key, $value);
+        }
+        $countStmt->execute();
+        $totalCount = (int)$countStmt->fetchColumn();
 
         foreach ($rows as &$row) {
             $urls = resolve_image_urls($row['image_urls'] ?? '');
@@ -362,16 +502,26 @@ try {
             $row['imageUrl']   = $urls[0] ?? '';
             $row['img_url']    = $urls[0] ?? '';
             $row['image_count'] = count($urls);
+            $row['category_normalized'] = normalize_category($row['category'] ?? '');
         }
         unset($row);
+
+        $categories = get_category_counts($pdo);
 
         api_json('success', 'Products fetched successfully', [
             'data' => $rows,
             'products' => $rows,
-            'count' => count($rows)
+            'count' => count($rows),
+            'total' => $totalCount,
+            'categories' => $categories,
+            'filter_category' => $category,
+            'has_more' => $limit > 0 ? ($totalCount > ($offset + count($rows))) : false
         ]);
     }
 
+    // ================================================================
+    // ADD / UPDATE PRODUCT (POST)
+    // ================================================================
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && in_array($action, ['', 'add','create','save','publish','update'], true)) {
         $input = $_POST;
         if (empty($input)) {
@@ -462,6 +612,7 @@ try {
             $product['imageUrl'] = $urls[0] ?? '';
             $product['img_url'] = $urls[0] ?? '';
             $product['image_count'] = count($urls);
+            $product['category_normalized'] = normalize_category($product['category'] ?? '');
         }
 
         api_json('success', $message, [
@@ -473,6 +624,9 @@ try {
         ]);
     }
 
+    // ================================================================
+    // DELETE PRODUCT (POST)
+    // ================================================================
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && $action === 'delete') {
         $id = (int)($_POST['id'] ?? $_GET['id'] ?? 0);
         if ($id <= 0) {
@@ -487,6 +641,40 @@ try {
         }
 
         api_json('success', 'Product deleted successfully');
+    }
+
+    // ================================================================
+    // GET PRODUCT BY ID
+    // ================================================================
+    if ($_SERVER['REQUEST_METHOD'] === 'GET' && $action === 'single') {
+        $id = (int)($_GET['id'] ?? 0);
+        if ($id <= 0) {
+            api_json('error', 'Valid product ID is required.', [], 422);
+        }
+
+        $stmt = $pdo->prepare(
+            "SELECT id, title, category, image_urls, description, material, print_type, created_at
+             FROM products WHERE id = :id"
+        );
+        $stmt->execute([':id' => $id]);
+        $product = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if (!$product) {
+            api_json('error', 'Product not found.', [], 404);
+        }
+
+        $urls = resolve_image_urls($product['image_urls'] ?? '');
+        $product['image_urls'] = $urls;
+        $product['image_url'] = $urls[0] ?? '';
+        $product['imageUrl'] = $urls[0] ?? '';
+        $product['img_url'] = $urls[0] ?? '';
+        $product['image_count'] = count($urls);
+        $product['category_normalized'] = normalize_category($product['category'] ?? '');
+
+        api_json('success', 'Product fetched successfully', [
+            'data' => $product,
+            'product' => $product
+        ]);
     }
 
     api_json('error', 'Invalid or missing action.', [], 400);
