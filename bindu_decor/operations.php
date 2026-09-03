@@ -1,17 +1,23 @@
 <?php
-
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Headers: Content-Type");
 header("Access-Control-Allow-Methods: POST, GET, OPTIONS");
-header("Content-Type: application/json");
+header("Content-Type: application/json; charset=UTF-8");
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit; }
 
-require_once __DIR__ . '/database.php';
-
-// ==========================================
-// CORE HELPER FUNCTIONS
-// ==========================================
+try {
+    if (!file_exists(__DIR__ . '/database.php')) {
+        http_response_code(500);
+        echo json_encode(["status" => "error", "message" => "Database file missing."]);
+        exit;
+    }
+    require_once __DIR__ . '/database.php';
+} catch (Throwable $e) {
+    http_response_code(500);
+    echo json_encode(["status" => "error", "message" => "Database load error: " . $e->getMessage()]);
+    exit;
+}
 
 function api_json($status, $message = '', $data = [], $code = 200) {
     http_response_code($code);
@@ -94,54 +100,6 @@ function save_uploaded($file,$prefix) {
     return [true,'uploads/'.$name];
 }
 
-function download_image($url,$prefix) {
-    $url = trim($url);
-    if (strpos($url,'//') === 0) $url = 'https:'.$url;
-    if (!preg_match('#^https?://#i',$url)) {
-        return [false,'Invalid external image URL: ' . $url];
-    }
-    $ch = curl_init($url);
-    if (!$ch) return [false,'Unable to initialize image download.'];
-    curl_setopt_array($ch,[
-        CURLOPT_RETURNTRANSFER=>true,
-        CURLOPT_FOLLOWLOCATION=>true,
-        CURLOPT_MAXREDIRS=>7,
-        CURLOPT_CONNECTTIMEOUT=>30,
-        CURLOPT_TIMEOUT=>90,
-        CURLOPT_USERAGENT=>'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36',
-        CURLOPT_HTTPHEADER=>['Accept: image/avif,image/webp,image/apng,image/*,*/*;q=0.8'],
-        CURLOPT_SSL_VERIFYPEER=>false,
-        CURLOPT_SSL_VERIFYHOST=>false,
-        CURLOPT_REFERER=>$_SERVER['HTTP_HOST'] ?? 'localhost'
-    ]);
-    $data = curl_exec($ch);
-    $code=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);
-    $err=curl_error($ch);
-    curl_close($ch);
-    if ($data === false || $code < 200 || $code >= 400 || $data === '') {
-        return [false,'Unable to download external image (HTTP '.$code.'). '.$err];
-    }
-    $tmp = tempnam(sys_get_temp_dir(),'bd_img_');
-    if ($tmp === false || file_put_contents($tmp,$data) === false) {
-        return [false,'Unable to create temporary image file.'];
-    }
-    [$ok,$mime] = valid_image($tmp);
-    if (!$ok) {
-        @unlink($tmp);
-        return [false,'External URL did not return a supported image. '.$mime];
-    }
-    $path = parse_url($url,PHP_URL_PATH) ?: '';
-    $ext = image_ext($mime, $path);
-    $name = unique_image_name($prefix, $ext);
-    $dest = uploads_dir().$name;
-    if (!rename($tmp,$dest)) {
-        @unlink($tmp);
-        return [false,'Unable to save downloaded image.'];
-    }
-    @chmod($dest, 0644);
-    return [true,'uploads/'.$name];
-}
-
 function uploaded_image($prefix) {
     foreach (['imageFile','image','image_file','file','media','photo','logo'] as $field) {
         if (isset($_FILES[$field]) && ($_FILES[$field]['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK) {
@@ -165,13 +123,11 @@ function input_image($prefix, $field = 'image_url') {
 
     if ($url === '') return [false, 'Image is required. Please upload a file or provide a URL.'];
 
-    // Direct External URL Support (NO local download to uploads/)
     if (preg_match('#^https?://#i', $url) || strpos($url, '//') === 0) {
         if (strpos($url, '//') === 0) $url = 'https:' . $url;
         return [true, $url];
     }
 
-    // Local file path validation
     $clean_path = ltrim(str_replace('\\', '/', $url), '/');
     if (stripos($clean_path, 'bindu_decor/') === 0) {
         $clean_path = substr($clean_path, strlen('bindu_decor/'));
@@ -192,16 +148,13 @@ function public_image_url($value) {
     $value = trim((string)$value);
     if ($value === '') return '';
 
-    // Direct HTTP/HTTPS or Base64 Data URIs return untouched
     if (preg_match('#^https?://#i', $value) || strpos($value, 'data:image/') === 0) {
         return $value;
     }
 
-    // Clean relative path
     $value = str_replace('\\', '/', $value);
     $value = ltrim($value, '/');
 
-    // Clean double prefixes
     $prefixes = ['bindu_decor/', 'api/bindu_decor/', 'uploads/uploads/'];
     foreach ($prefixes as $prefix) {
         if (stripos($value, $prefix) === 0) {
@@ -210,17 +163,14 @@ function public_image_url($value) {
         }
     }
 
-    // Ensure path starts with uploads/ unless it's image.php
     if (stripos($value, 'uploads/') !== 0 && stripos($value, 'image.php') !== 0) {
         $value = 'uploads/' . $value;
     }
 
-    // Format local uploads through image.php proxy for CORS and reliable delivery
     if (stripos($value, 'image.php') !== 0) {
         $value = 'image.php?path=' . rawurlencode($value);
     }
 
-    // Return full absolute URL for Flutter
     return rtrim(api_base_url(), '/') . '/' . $value;
 }
 
@@ -241,10 +191,6 @@ function delete_stored_image($value) {
         @unlink($file);
     }
 }
-
-// ==========================================
-// API ROUTES (products, projects, clients)
-// ==========================================
 
 try {
     $action=request_action();
@@ -391,4 +337,4 @@ try {
 } catch(Throwable $e){
     api_json('error','Server error: '.$e->getMessage(),[],500);
 }
-?>s
+?>

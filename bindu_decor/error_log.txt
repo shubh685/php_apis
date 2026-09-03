@@ -1,3 +1,0 @@
-[29-Aug-2026 09:29:26 Europe/Berlin] Products API Error: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'image_urls' in 'field list' in C:\xampp\htdocs\bindu_decor\products.php:489
-[29-Aug-2026 09:30:10 Europe/Berlin] Products API Error: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'image_urls' in 'field list' in C:\xampp\htdocs\bindu_decor\products.php:489
-[29-Aug-2026 09:31:46 Europe/Berlin] Products API Error: SQLSTATE[42S22]: Column not found: 1054 Unknown column 'image_urls' in 'field list' in C:\xampp\htdocs\bindu_decor\products.php:593

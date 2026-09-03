@@ -1,240 +1,251 @@
 <?php
+declare(strict_types=1);
 
+// =====================================================
+// CORS & HEADERS
+// =====================================================
 header("Access-Control-Allow-Origin: *");
-header("Access-Control-Allow-Headers: Content-Type");
-header("Access-Control-Allow-Methods: POST, GET, OPTIONS");
-header("Content-Type: application/json");
+header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Access-Control-Allow-Headers, Authorization, X-Requested-With");
+header("Content-Type: application/json; charset=UTF-8");
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { http_response_code(200); exit; }
-require_once __DIR__ . '/database.php';
-
-function api_json($status, $message = '', $data = [], $code = 200) {
-    http_response_code($code);
-    echo json_encode(array_merge(['status'=>$status,'message'=>$message], $data), JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
-    exit;
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { 
+    http_response_code(200); 
+    exit(); 
 }
 
-function api_base_url() {
-    $https = (!empty($_SERVER['HTTPS']) && strtolower($_SERVER['HTTPS']) !== 'off') || (isset($_SERVER['SERVER_PORT']) && (int)$_SERVER['SERVER_PORT'] === 443);
+require_once __DIR__ . '/database.php';
+
+// =====================================================
+// HELPER FUNCTIONS
+// =====================================================
+function api_base_url(): string {
+    $https = (!empty($_SERVER['HTTPS']) && strtolower($_SERVER['HTTPS']) !== 'off')
+          || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https')
+          || (isset($_SERVER['SERVER_PORT']) && (int)$_SERVER['SERVER_PORT'] === 443);
+    
     $protocol = $https ? 'https' : 'http';
     $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
     $script = $_SERVER['SCRIPT_NAME'] ?? '';
     $directory = str_replace('\\', '/', dirname($script));
     $directory = trim($directory, '/');
+
     if ($directory === '' || $directory === '.') {
         return $protocol . '://' . $host;
     }
     return $protocol . '://' . $host . '/' . $directory;
 }
 
-function uploads_dir() {
-    $dir = __DIR__ . DIRECTORY_SEPARATOR . 'uploads' . DIRECTORY_SEPARATOR;
-    if (!is_dir($dir) && !mkdir($dir, 0755, true)) {
-        api_json('error', 'Unable to create uploads directory.', [], 500);
-    }
-    if (!is_writable($dir)) {
-        @chmod($dir, 0755);
-        if (!is_writable($dir)) {
-            api_json('error', 'Uploads directory is not writable.', [], 500);
-        }
-    }
-    return $dir;
-}
-
-function image_ext($mime, $name='') {
-    $map = ['image/jpeg'=>'jpg','image/jpg'=>'jpg','image/png'=>'png','image/webp'=>'webp','image/gif'=>'gif','image/bmp'=>'bmp','image/x-ms-bmp'=>'bmp','image/avif'=>'avif'];
-    $mime = strtolower(trim((string)$mime));
-    if (isset($map[$mime])) return $map[$mime];
-    $e = strtolower(pathinfo($name, PATHINFO_EXTENSION));
-    if ($e === 'jpeg') $e = 'jpg';
-    return in_array($e,['jpg','png','webp','gif','bmp','avif'],true) ? $e : 'jpg';
-}
-
-function valid_image($path) {
-    if (!is_file($path) || filesize($path) <= 0) return [false,'Image file is empty or missing.'];
-    $info = @getimagesize($path);
-    if ($info === false) return [false,'File is not a valid image.'];
-    $mime = strtolower((string)($info['mime'] ?? ''));
-    $allowed = ['image/jpeg','image/png','image/webp','image/gif','image/bmp','image/x-ms-bmp','image/avif'];
-    if (!in_array($mime,$allowed,true)) return [false,'Unsupported image type: '.$mime];
-    return [true,$mime];
-}
-
-function unique_image_name($prefix,$ext) {
-    return $prefix.'_'.date('Ymd_His').'_'.bin2hex(random_bytes(8)).'.'.$ext;
-}
-
-function save_uploaded($file,$prefix) {
-    if (!isset($file['error']) || $file['error'] !== UPLOAD_ERR_OK) {
-        return [false,'Upload failed. Error code: '.($file['error'] ?? 'unknown')];
-    }
-    if (empty($file['tmp_name']) || !is_uploaded_file($file['tmp_name'])) {
-        return [false,'Invalid uploaded file.'];
-    }
-    [$ok,$mime] = valid_image($file['tmp_name']);
-    if (!$ok) return [false,$mime];
-    $name = unique_image_name($prefix,image_ext($mime,$file['name'] ?? ''));
-    $dest = uploads_dir().$name;
-    if (!move_uploaded_file($file['tmp_name'],$dest)) {
-        return [false,'Unable to save uploaded image. Check uploads permissions.'];
-    }
-    @chmod($dest, 0644);
-    if (!is_file($dest) || filesize($dest) <= 0) {
-        return [false,'Uploaded image was not saved correctly.'];
-    }
-    return [true,'uploads/'.$name];
-}
-
-function uploaded_image($prefix) {
-    foreach (['imageFile','image','image_file','file','media','photo','logo'] as $field) {
-        if (isset($_FILES[$field]) && ($_FILES[$field]['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK) {
-            return save_uploaded($_FILES[$field],$prefix);
-        }
-    }
-    return null;
-}
-
-function input_image($prefix, $field = 'image_url') {
-    $uploaded = uploaded_image($prefix);
-    if ($uploaded !== null) return $uploaded;
-
-    $url = '';
-    foreach ([$field, 'image_url', 'imageUrl', 'img_url', 'imgUrl', 'url', 'media_url', 'mediaUrl'] as $key) {
-        if (isset($_POST[$key]) && trim((string)$_POST[$key]) !== '') {
-            $url = trim((string)$_POST[$key]);
-            break;
-        }
-    }
-
-    if ($url === '') return [false, 'Image is required. Please upload a file or provide a URL.'];
-
-    // Direct External URL Support
-    if (preg_match('#^https?://#i', $url) || strpos($url, '//') === 0) {
-        if (strpos($url, '//') === 0) $url = 'https:' . $url;
-        return [true, $url];
-    }
-
-    // Local file path validation
-    $clean_path = ltrim(str_replace('\\', '/', $url), '/');
-    if (stripos($clean_path, 'bindu_decor/') === 0) {
-        $clean_path = substr($clean_path, strlen('bindu_decor/'));
-    }
-    if (stripos($clean_path, 'uploads/uploads/') === 0) {
-        $clean_path = substr($clean_path, strlen('uploads/'));
-    }
-
-    $physical_path = __DIR__ . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $clean_path);
-    if (file_exists($physical_path) && is_file($physical_path)) {
-        return [true, $clean_path];
-    }
-
-    return [false, 'The image file does not exist on the server: ' . $url];
-}
-
-function public_image_url($value) {
+function public_image_url($value): string {
     $value = trim((string)$value);
     if ($value === '') return '';
 
-    // Direct External HTTP/HTTPS URLs or Base64 Data URIs returned untouched
+    // Direct External HTTP/HTTPS URLs
     if (preg_match('#^https?://#i', $value) || strpos($value, 'data:image/') === 0) {
-        if (strpos($value, api_base_url() . '/uploads/') === 0) {
-            $value = str_replace(api_base_url() . '/', '', $value);
-        } else {
-            return $value;
-        }
+        return $value;
     }
 
-    // Clean relative path
+    // Standardize slashes
     $value = str_replace('\\', '/', $value);
     $value = ltrim($value, '/');
 
-    // Clean double prefixes
+    // Remove redundant base folders
     $prefixes = ['bindu_decor/', 'api/bindu_decor/', 'uploads/uploads/'];
     foreach ($prefixes as $prefix) {
         if (stripos($value, $prefix) === 0) {
             $value = substr($value, strlen($prefix));
+            break;
         }
     }
 
-    // If string already uses image.php, format base URL correctly
-    if (stripos($value, 'image.php') !== false) {
-        return rtrim(api_base_url(), '/') . '/' . ltrim($value, '/');
-    }
-
-    // Ensure path starts with uploads/
     if (stripos($value, 'uploads/') !== 0) {
         $value = 'uploads/' . $value;
     }
 
-    // Proxy through image.php at root directory to resolve CORS & static file access constraints
-    return rtrim(api_base_url(), '/') . '/image.php?path=' . rawurlencode($value);
+    return rtrim(api_base_url(), '/') . '/' . $value;
 }
 
-function request_action() {
-    return strtolower(trim((string)($_REQUEST['action'] ?? '')));
+function uploads_dir(): string {
+    $dir = __DIR__ . DIRECTORY_SEPARATOR . 'uploads' . DIRECTORY_SEPARATOR;
+    if (!is_dir($dir) && !mkdir($dir, 0755, true)) {
+        http_response_code(500);
+        echo json_encode(["status" => "error", "message" => "Unable to create uploads directory."], JSON_UNESCAPED_SLASHES);
+        exit();
+    }
+    return $dir;
 }
 
-function delete_stored_image($value) {
-    $value=trim((string)$value);
-    if ($value==='' || preg_match('#^https?://#i',$value)) return;
-    $value=ltrim(str_replace('\\','/',$value),'/');
-    if (stripos($value,'bindu_decor/')===0) {
-        $value=substr($value,strlen('bindu_decor/'));
+function save_uploaded_client_image(array $file): array {
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        return [false, 'File upload error code: ' . $file['error']];
     }
-    $root=realpath(__DIR__);
-    $file=realpath(__DIR__.DIRECTORY_SEPARATOR.$value);
-    if ($file && $root && str_starts_with($file,$root.DIRECTORY_SEPARATOR) && is_file($file)) {
-        @unlink($file);
+    
+    $ext = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+    if ($ext === 'jpeg') $ext = 'jpg';
+    $allowed = ['jpg', 'png', 'webp', 'gif', 'bmp', 'avif'];
+    
+    if (!in_array($ext, $allowed, true)) {
+        return [false, 'Unsupported image type: ' . $ext];
     }
+
+    $filename = 'client_' . date('Ymd_His') . '_' . bin2hex(random_bytes(6)) . '.' . $ext;
+    $dest = uploads_dir() . $filename;
+
+    if (!move_uploaded_file($file['tmp_name'], $dest)) {
+        return [false, 'Failed to save uploaded file.'];
+    }
+
+    return [true, 'uploads/' . $filename];
 }
+
+// Format single client record image paths
+function format_client_data(array $client): array {
+    $img = $client['img_url'] ?? ($client['image_url'] ?? '');
+    $formatted_url = public_image_url($img);
+    
+    $client['img_url'] = $formatted_url;
+    $client['image_url'] = $formatted_url; // Verified dual mapping for backward compatibility
+    
+    return $client;
+}
+
+// =====================================================
+// API REQUEST HANDLING
+// =====================================================
+$method = $_SERVER['REQUEST_METHOD'];
 
 try {
-    $action=request_action();
+    switch ($method) {
+        case 'GET':
+            if (isset($_GET['id'])) {
+                $stmt = $pdo->prepare("SELECT * FROM clients WHERE id = ?");
+                $stmt->execute([$_GET['id']]);
+                $client = $stmt->fetch(PDO::FETCH_ASSOC);
 
-    if ($_SERVER['REQUEST_METHOD']==='GET' && ($action==='' || in_array($action,['fetch','get','list'],true))) {
-        $rows=$pdo->query("SELECT id,img_url,created_at FROM clients ORDER BY id DESC")->fetchAll(PDO::FETCH_ASSOC);
-        foreach($rows as &$r){
-            $u=public_image_url($r['img_url']??'');
-            $r['img_url']=$u;
-            $r['image_url']=$u;
-            $r['imageUrl']=$u;
-            $r['imgUrl']=$u;
-        }
-        api_json('success','Clients fetched successfully',['data'=>$rows,'clients'=>$rows]);
+                if ($client) {
+                    echo json_encode([
+                        "status" => "success", 
+                        "data" => format_client_data($client)
+                    ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                } else {
+                    http_response_code(404);
+                    echo json_encode(["status" => "error", "message" => "Client not found"]);
+                }
+            } else {
+                $stmt = $pdo->query("SELECT * FROM clients ORDER BY id DESC");
+                $clients = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+                $formatted_clients = array_map('format_client_data', $clients);
+
+                echo json_encode([
+                    "status" => "success", 
+                    "data" => $formatted_clients
+                ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            }
+            break;
+
+        case 'POST':
+            $input = json_decode(file_get_contents("php://input"), true) ?? $_POST;
+            $id = $input['id'] ?? ($_GET['id'] ?? null);
+
+            $img_path = '';
+
+            // 1. Handle File Uploads
+            if (isset($_FILES['img_url']) && $_FILES['img_url']['error'] === UPLOAD_ERR_OK) {
+                [$ok, $res] = save_uploaded_client_image($_FILES['img_url']);
+                if ($ok) $img_path = $res;
+            } elseif (isset($_FILES['image_url']) && $_FILES['image_url']['error'] === UPLOAD_ERR_OK) {
+                [$ok, $res] = save_uploaded_client_image($_FILES['image_url']);
+                if ($ok) $img_path = $res;
+            }
+
+            // 2. Handle Text Inputs if no file uploaded
+            if (empty($img_path)) {
+                $img_path = $input['img_url'] ?? ($input['image_url'] ?? '');
+            }
+
+            // UPDATE CLIENT
+            if ($id) {
+                $check_stmt = $pdo->prepare("SELECT * FROM clients WHERE id = ?");
+                $check_stmt->execute([$id]);
+                $existing = $check_stmt->fetch(PDO::FETCH_ASSOC);
+
+                if (!$existing) {
+                    http_response_code(404);
+                    echo json_encode(["status" => "error", "message" => "Client not found"]);
+                    exit();
+                }
+
+                $name = !empty($input['name']) ? trim((string)$input['name']) : $existing['name'];
+                $final_img = !empty($img_path) ? $img_path : ($existing['img_url'] ?? $existing['image_url'] ?? '');
+
+                $stmt = $pdo->prepare("UPDATE clients SET name = ?, img_url = ? WHERE id = ?");
+                $stmt->execute([$name, $final_img, $id]);
+
+                $updated_stmt = $pdo->prepare("SELECT * FROM clients WHERE id = ?");
+                $updated_stmt->execute([$id]);
+                $updated_client = $updated_stmt->fetch(PDO::FETCH_ASSOC);
+
+                echo json_encode([
+                    "status" => "success",
+                    "message" => "Client updated successfully",
+                    "data" => format_client_data($updated_client)
+                ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+                break;
+            }
+
+            // CREATE CLIENT
+            $name = trim((string)($input['name'] ?? ''));
+            if (empty($name)) {
+                http_response_code(400);
+                echo json_encode(["status" => "error", "message" => "Client name is required"]);
+                exit();
+            }
+
+            $stmt = $pdo->prepare("INSERT INTO clients (name, img_url) VALUES (?, ?)");
+            $stmt->execute([$name, $img_path]);
+
+            $new_id = (int)$pdo->lastInsertId();
+            $new_stmt = $pdo->prepare("SELECT * FROM clients WHERE id = ?");
+            $new_stmt->execute([$new_id]);
+            $new_client = $new_stmt->fetch(PDO::FETCH_ASSOC);
+
+            echo json_encode([
+                "status" => "success",
+                "message" => "Client added successfully",
+                "data" => format_client_data($new_client)
+            ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+            break;
+
+        case 'DELETE':
+            $input = json_decode(file_get_contents("php://input"), true) ?? [];
+            $id = $_GET['id'] ?? ($input['id'] ?? null);
+
+            if (!$id) {
+                http_response_code(400);
+                echo json_encode(["status" => "error", "message" => "Client ID is required"]);
+                exit();
+            }
+
+            $stmt = $pdo->prepare("DELETE FROM clients WHERE id = ?");
+            $stmt->execute([$id]);
+
+            echo json_encode([
+                "status" => "success", 
+                "message" => "Client deleted successfully"
+            ], JSON_UNESCAPED_SLASHES);
+            break;
+
+        default:
+            http_response_code(405);
+            echo json_encode(["status" => "error", "message" => "Method Not Allowed"]);
+            break;
     }
-
-    if ($_SERVER['REQUEST_METHOD']==='POST' && in_array($action,['','add','create','save','publish'],true)) {
-        [$ok,$image]=input_image('client','image_url');
-        if(!$ok) api_json('error',$image,[],422);
-        $s=$pdo->prepare('INSERT INTO clients (img_url) VALUES (:img_url)');
-        $s->execute([':img_url'=>$image]);
-        $id=(int)$pdo->lastInsertId();
-        $url=public_image_url($image);
-        api_json('success','Client logo published successfully',[
-            'id'=>$id,
-            'img_url'=>$url,
-            'image_url'=>$url,
-            'imageUrl'=>$url,
-            'imgUrl'=>$url,
-            'data'=>['id'=>$id,'img_url'=>$url,'image_url'=>$url,'imageUrl'=>$url,'imgUrl'=>$url]
-        ],201);
-    }
-
-    if ($_SERVER['REQUEST_METHOD']==='POST' && $action==='delete') {
-        $id=(int)($_POST['id']??$_GET['id']??0);
-        if($id<=0) api_json('error','Valid client ID is required.',[],422);
-        $q=$pdo->prepare('SELECT img_url FROM clients WHERE id=:id');
-        $q->execute([':id'=>$id]);
-        $old=$q->fetch(PDO::FETCH_ASSOC);
-        $d=$pdo->prepare('DELETE FROM clients WHERE id=:id');
-        $d->execute([':id'=>$id]);
-        if(!$d->rowCount()) api_json('error','Client not found.',[],404);
-        if($old) delete_stored_image($old['img_url']??'');
-        api_json('success','Client deleted successfully');
-    }
-
-    api_json('error','Invalid or missing action.',[],400);
-} catch(Throwable $e){
-    api_json('error','Server error: '.$e->getMessage(),[],500);
+} catch (PDOException $e) {
+    http_response_code(500);
+    echo json_encode(["status" => "error", "message" => "Database error: " . $e->getMessage()]);
+} catch (Exception $e) {
+    http_response_code(500);
+    echo json_encode(["status" => "error", "message" => "Server error: " . $e->getMessage()]);
 }
 ?>

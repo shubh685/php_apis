@@ -1,13 +1,10 @@
 <?php
 // image.php
 // Serves files from /uploads through PHP instead of direct static access,
-// so images get exactly the same CORS headers and connection path that
-// your working clients.php / projects.php / products.php already use.
-//
-// Usage: image.php?path=uploads/client_20260824_121828_xxx.png
+// eliminating static CORS restrictions and 403 permission blocks.
 
 header("Access-Control-Allow-Origin: *");
-header("Access-Control-Allow-Headers: Content-Type");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept");
 header("Access-Control-Allow-Methods: GET, OPTIONS");
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -31,7 +28,7 @@ $path = str_replace('\\', '/', $path);
 $path = str_replace('..', '', $path);
 $path = ltrim($path, '/');
 
-// Strip known duplicate prefixes, same logic as your existing public_image_url()
+// Strip known duplicate prefixes
 $prefixes = ['bindu_decor/', 'api/bindu_decor/', 'uploads/uploads/'];
 foreach ($prefixes as $p) {
     if (stripos($path, $p) === 0) {
@@ -45,29 +42,53 @@ if (stripos($path, 'uploads/') !== 0) {
     $path = 'uploads/' . $path;
 }
 
-// URL-decode the filename portion (public_image_url() encodes it when returning URLs)
+// URL-decode the filename portion
 $parts = explode('/', $path);
 $last = array_pop($parts);
 $last = rawurldecode($last);
 $path = implode('/', array_merge($parts, [$last]));
 
-$root = realpath(__DIR__);
-$fullPath = realpath(__DIR__ . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $path));
+$root = rtrim(str_replace('\\', '/', realpath(__DIR__)), '/');
+$targetFile = __DIR__ . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $path);
+$fullPath = realpath($targetFile);
 
-// Security: make sure resolved path is still inside this directory
-if (!$fullPath || !$root || strpos($fullPath, $root . DIRECTORY_SEPARATOR) !== 0) {
-    fail('Invalid path.', 400);
+// Fallback checking for files on Linux server environments
+if (!$fullPath) {
+    $fullPath = $targetFile;
 }
 
-if (!is_file($fullPath)) {
+$normalizedFullPath = str_replace('\\', '/', $fullPath);
+
+// Security: Ensure resolved path resides within the root script directory
+if (strpos($normalizedFullPath, $root) !== 0) {
+    fail('Invalid path or access forbidden.', 403);
+}
+
+if (!is_file($fullPath) || !file_exists($fullPath)) {
     fail('Image not found: ' . $path, 404);
 }
+
+// Ensure file readable permission
+@chmod($fullPath, 0644);
 
 $mime = @mime_content_type($fullPath);
 if (!$mime) {
     $ext = strtolower(pathinfo($fullPath, PATHINFO_EXTENSION));
-    $map = ['jpg'=>'image/jpeg','jpeg'=>'image/jpeg','png'=>'image/png','webp'=>'image/webp','gif'=>'image/gif','bmp'=>'image/bmp','avif'=>'image/avif'];
+    $map = [
+        'jpg' => 'image/jpeg',
+        'jpeg' => 'image/jpeg',
+        'png' => 'image/png',
+        'webp' => 'image/webp',
+        'gif' => 'image/gif',
+        'bmp' => 'image/bmp',
+        'avif' => 'image/avif'
+    ];
     $mime = $map[$ext] ?? 'application/octet-stream';
+}
+
+// Clean any accidental output buffers before delivering image streams
+if (ob_get_level()) {
+    ob_end_clean();
 }
 
 header('Content-Type: ' . $mime);
@@ -76,3 +97,4 @@ header('Cache-Control: public, max-age=604800');
 header('X-Content-Type-Options: nosniff');
 readfile($fullPath);
 exit;
+?>

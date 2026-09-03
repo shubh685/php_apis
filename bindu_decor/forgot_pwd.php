@@ -1,9 +1,22 @@
 <?php
 
+// =====================================================
+// CORS HEADERS
+// =====================================================
+
 header("Access-Control-Allow-Origin: *");
-header("Access-Control-Allow-Headers: Content-Type, Authorization");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With");
 header("Access-Control-Allow-Methods: POST, OPTIONS");
 header("Content-Type: application/json; charset=UTF-8");
+
+// =====================================================
+// ERROR HANDLING
+// =====================================================
+
+error_reporting(E_ALL);
+ini_set('display_errors', 0);
+ini_set('log_errors', 1);
+ini_set('error_log', 'php_errors.log');
 
 // =====================================================
 // CORS PREFLIGHT
@@ -14,17 +27,53 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit();
 }
 
-require_once "database.php";
+// =====================================================
+// CHECK FILES & LOAD LIBRARIES
+// =====================================================
 
-require "PHPMailer/src/PHPMailer.php";
-require "PHPMailer/src/SMTP.php";
-require "PHPMailer/src/Exception.php";
+$baseDir = __DIR__;
+
+try {
+    if (!file_exists($baseDir . "/database.php")) {
+        http_response_code(500);
+        echo json_encode([
+            "status" => false,
+            "message" => "Database configuration file not found"
+        ]);
+        exit();
+    }
+
+    require_once $baseDir . "/database.php";
+
+    // Check PHPMailer files
+    $phpmailerBase = $baseDir . "/PHPMailer/src/";
+    if (!file_exists($phpmailerBase . "PHPMailer.php")) {
+        http_response_code(500);
+        echo json_encode([
+            "status" => false,
+            "message" => "PHPMailer library not found. Please check the installation."
+        ]);
+        exit();
+    }
+
+    require_once $phpmailerBase . "PHPMailer.php";
+    require_once $phpmailerBase . "SMTP.php";
+    require_once $phpmailerBase . "Exception.php";
+
+} catch (Throwable $e) {
+    http_response_code(500);
+    echo json_encode([
+        "status" => false,
+        "message" => "Initialization error: " . $e->getMessage()
+    ]);
+    exit();
+}
 
 use PHPMailer\PHPMailer\PHPMailer;
 use PHPMailer\PHPMailer\Exception;
 
 // =====================================================
-// ONLY POST
+// METHOD VALIDATION
 // =====================================================
 
 if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
@@ -37,7 +86,7 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
 }
 
 // =====================================================
-// READ JSON / POST DATA
+// READ INPUT
 // =====================================================
 
 $rawData = file_get_contents("php://input");
@@ -58,9 +107,6 @@ function cleanEmail($email)
     return strtolower(trim((string)$email));
 }
 
-/**
- * Returns user-provided device time if valid, otherwise falls back to server time.
- */
 function getDeviceTimestamp($data)
 {
     $deviceTime = trim((string)($data['device_time'] ?? $data['updated_at'] ?? ''));
@@ -75,7 +121,6 @@ function getDeviceTimestamp($data)
 // =====================================================
 
 if ($action === 'send_otp') {
-
     $email = cleanEmail($data['input'] ?? $data['email'] ?? '');
     $deviceTime = getDeviceTimestamp($data);
 
@@ -89,7 +134,12 @@ if ($action === 'send_otp') {
     }
 
     try {
-        // FIND USER
+        // Check PDO connection
+        if (!isset($pdo)) {
+            throw new Exception("Database connection not established");
+        }
+
+        // Find User
         $stmt = $pdo->prepare("
             SELECT id, name, email
             FROM users
@@ -108,11 +158,11 @@ if ($action === 'send_otp') {
             exit();
         }
 
-        // GENERATE SECURE 6-DIGIT OTP
+        // Generate Secure 6-Digit OTP
         $otp = (string) random_int(100000, 999999);
         $expiry = date("Y-m-d H:i:s", strtotime("+5 minutes"));
 
-        // SAVE OTP TO DATABASE AND UPDATE updated_at WITH DEVICE TIME
+        // Save OTP to Database
         $update = $pdo->prepare("
             UPDATE users
             SET
@@ -129,7 +179,7 @@ if ($action === 'send_otp') {
             $user['id']
         ]);
 
-        // SEND MAIL VIA PHPMAILER
+        // Send Mail via PHPMailer
         $mail = new PHPMailer(true);
 
         try {
@@ -137,9 +187,10 @@ if ($action === 'send_otp') {
             $mail->Host       = "smtp.gmail.com";
             $mail->SMTPAuth   = true;
             $mail->Username   = "shahshubham128@gmail.com"; 
-            $mail->Password   = "gswc cdls hjxu ofuc"; // Replace with your App Password
+            $mail->Password   = "gswc cdls hjxu ofuc"; // Your App Password
             $mail->SMTPSecure = PHPMailer::ENCRYPTION_STARTTLS;
             $mail->Port       = 587;
+            $mail->CharSet    = 'UTF-8';
 
             $mail->setFrom("shahshubham128@gmail.com", "Bindu Decor Admin");
             $mail->addAddress($user['email'], $user['name']);
@@ -178,7 +229,7 @@ if ($action === 'send_otp') {
         } catch (Exception $e) {
             error_log("OTP Mail Error: " . $mail->ErrorInfo);
 
-            // Rollback OTP state on mail failure and refresh updated_at with device time
+            // Rollback OTP state on mail failure
             $pdo->prepare("
                 UPDATE users
                 SET otp = NULL,
@@ -191,7 +242,7 @@ if ($action === 'send_otp') {
             http_response_code(500);
             echo json_encode([
                 "status" => false,
-                "message" => "Unable to send OTP email. Check server logs."
+                "message" => "Unable to send OTP email. Please try again later."
             ]);
             exit();
         }
@@ -201,7 +252,15 @@ if ($action === 'send_otp') {
         http_response_code(500);
         echo json_encode([
             "status" => false,
-            "message" => "Database server error"
+            "message" => "Database error: " . $e->getMessage()
+        ]);
+        exit();
+    } catch (Throwable $e) {
+        error_log("Send OTP Error: " . $e->getMessage());
+        http_response_code(500);
+        echo json_encode([
+            "status" => false,
+            "message" => "Server error: " . $e->getMessage()
         ]);
         exit();
     }
@@ -212,7 +271,6 @@ if ($action === 'send_otp') {
 // =====================================================
 
 if ($action === 'verify_otp') {
-
     $email      = cleanEmail($data['input'] ?? $data['email'] ?? '');
     $otp        = trim((string)($data['otp'] ?? ''));
     $deviceTime = getDeviceTimestamp($data);
@@ -227,6 +285,10 @@ if ($action === 'verify_otp') {
     }
 
     try {
+        if (!isset($pdo)) {
+            throw new Exception("Database connection not established");
+        }
+
         $stmt = $pdo->prepare("
             SELECT id, email, otp, otp_expiry
             FROM users
@@ -254,7 +316,7 @@ if ($action === 'verify_otp') {
             exit();
         }
 
-        // CHECK EXPIRY
+        // Check Expiry
         if (strtotime($user['otp_expiry']) < time()) {
             $pdo->prepare("
                 UPDATE users
@@ -273,7 +335,7 @@ if ($action === 'verify_otp') {
             exit();
         }
 
-        // SECURE HASH COMPARISON
+        // Secure Hash Comparison
         if (!hash_equals((string)$user['otp'], (string)$otp)) {
             http_response_code(400);
             echo json_encode([
@@ -283,7 +345,7 @@ if ($action === 'verify_otp') {
             exit();
         }
 
-        // MARK AS VERIFIED AND UPDATE updated_at WITH DEVICE TIME
+        // Mark as Verified
         $update = $pdo->prepare("
             UPDATE users
             SET otp_verified = 1,
@@ -304,7 +366,15 @@ if ($action === 'verify_otp') {
         http_response_code(500);
         echo json_encode([
             "status" => false,
-            "message" => "Server error"
+            "message" => "Database error: " . $e->getMessage()
+        ]);
+        exit();
+    } catch (Throwable $e) {
+        error_log("Verify OTP Error: " . $e->getMessage());
+        http_response_code(500);
+        echo json_encode([
+            "status" => false,
+            "message" => "Server error: " . $e->getMessage()
         ]);
         exit();
     }
@@ -315,7 +385,6 @@ if ($action === 'verify_otp') {
 // =====================================================
 
 if ($action === 'reset_password') {
-
     $email       = cleanEmail($data['email'] ?? '');
     $passwordRaw = (string)($data['password'] ?? '');
     $deviceTime  = getDeviceTimestamp($data);
@@ -330,6 +399,10 @@ if ($action === 'reset_password') {
     }
 
     try {
+        if (!isset($pdo)) {
+            throw new Exception("Database connection not established");
+        }
+
         $stmt = $pdo->prepare("
             SELECT id, email, otp_verified, otp_expiry
             FROM users
@@ -357,7 +430,7 @@ if ($action === 'reset_password') {
             exit();
         }
 
-        // CHECK IF OTP WINDOW IS STILL VALID
+        // Check if OTP window is still valid
         if (empty($user['otp_expiry']) || strtotime($user['otp_expiry']) < time()) {
             $pdo->prepare("
                 UPDATE users
@@ -376,7 +449,7 @@ if ($action === 'reset_password') {
             exit();
         }
 
-        // HASH NEW PASSWORD, CLEAR OTP, & UPDATE updated_at WITH DEVICE TIME
+        // Hash New Password, Clear OTP
         $hashedPassword = password_hash($passwordRaw, PASSWORD_DEFAULT);
 
         $update = $pdo->prepare("
@@ -406,7 +479,15 @@ if ($action === 'reset_password') {
         http_response_code(500);
         echo json_encode([
             "status" => false,
-            "message" => "Unable to update password"
+            "message" => "Database error: " . $e->getMessage()
+        ]);
+        exit();
+    } catch (Throwable $e) {
+        error_log("Reset Password Error: " . $e->getMessage());
+        http_response_code(500);
+        echo json_encode([
+            "status" => false,
+            "message" => "Server error: " . $e->getMessage()
         ]);
         exit();
     }
