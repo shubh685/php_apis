@@ -40,16 +40,16 @@ function public_image_url($value): string {
     $value = trim((string)$value);
     if ($value === '') return '';
 
-    // Direct External HTTP/HTTPS URLs
-    if (preg_match('#^https?://#i', $value) || strpos($value, 'data:image/') === 0) {
+    // If it's already a full URL, return as is
+    if (preg_match('#^https?://#i', $value)) {
         return $value;
     }
 
-    // Standardize slashes
+    // Clean the path
     $value = str_replace('\\', '/', $value);
     $value = ltrim($value, '/');
 
-    // Remove redundant base folders
+    // Remove duplicate prefixes
     $prefixes = ['bindu_decor/', 'api/bindu_decor/', 'uploads/uploads/'];
     foreach ($prefixes as $prefix) {
         if (stripos($value, $prefix) === 0) {
@@ -58,11 +58,15 @@ function public_image_url($value): string {
         }
     }
 
-    if (stripos($value, 'uploads/') !== 0) {
-        $value = 'uploads/' . $value;
+    // If it already has uploads/ prefix, keep it
+    if (stripos($value, 'uploads/') === 0) {
+        // Extract just the filename
+        $value = substr($value, 8); // Remove 'uploads/'
     }
 
-    return rtrim(api_base_url(), '/') . '/' . $value;
+    // Build full URL using image.php
+    $base_url = rtrim(api_base_url(), '/');
+    return $base_url . '/image.php?path=' . urlencode($value);
 }
 
 function uploads_dir(): string {
@@ -98,13 +102,14 @@ function save_uploaded_client_image(array $file): array {
     return [true, 'uploads/' . $filename];
 }
 
-// Format single client record image paths
 function format_client_data(array $client): array {
-    $img = $client['img_url'] ?? ($client['image_url'] ?? '');
+    $img = $client['img_url'] ?? '';
     $formatted_url = public_image_url($img);
     
-    $client['img_url'] = $formatted_url;
-    $client['image_url'] = $formatted_url; // Verified dual mapping for backward compatibility
+    // Return both the stored path and the full URL
+    $client['img_url'] = $formatted_url;          // Full URL for display (via image.php)
+    $client['image_url'] = $formatted_url;        // Full URL for display (via image.php)
+    $client['img_path'] = $img;                    // Stored path in database
     
     return $client;
 }
@@ -145,13 +150,37 @@ try {
             break;
 
         case 'POST':
-            $input = json_decode(file_get_contents("php://input"), true) ?? $_POST;
+            // Read JSON input or fallback to $_POST for multipart/form-data
+            $raw_input = json_decode(file_get_contents("php://input"), true);
+            $input = is_array($raw_input) ? array_merge($_POST, $raw_input) : $_POST;
+
+            $action = $_REQUEST['action'] ?? ($input['action'] ?? '');
             $id = $input['id'] ?? ($_GET['id'] ?? null);
+
+            if ($action === 'delete') {
+                if (!$id) {
+                    http_response_code(400);
+                    echo json_encode(["status" => "error", "message" => "Client ID is required"]);
+                    exit();
+                }
+
+                $stmt = $pdo->prepare("DELETE FROM clients WHERE id = ?");
+                $stmt->execute([$id]);
+
+                echo json_encode([
+                    "status" => "success", 
+                    "message" => "Client deleted successfully"
+                ], JSON_UNESCAPED_SLASHES);
+                break;
+            }
 
             $img_path = '';
 
-            // 1. Handle File Uploads
-            if (isset($_FILES['img_url']) && $_FILES['img_url']['error'] === UPLOAD_ERR_OK) {
+            // Handle file upload
+            if (isset($_FILES['imageFile']) && $_FILES['imageFile']['error'] === UPLOAD_ERR_OK) {
+                [$ok, $res] = save_uploaded_client_image($_FILES['imageFile']);
+                if ($ok) $img_path = $res;
+            } elseif (isset($_FILES['img_url']) && $_FILES['img_url']['error'] === UPLOAD_ERR_OK) {
                 [$ok, $res] = save_uploaded_client_image($_FILES['img_url']);
                 if ($ok) $img_path = $res;
             } elseif (isset($_FILES['image_url']) && $_FILES['image_url']['error'] === UPLOAD_ERR_OK) {
@@ -159,12 +188,22 @@ try {
                 if ($ok) $img_path = $res;
             }
 
-            // 2. Handle Text Inputs if no file uploaded
+            // Fallback to URL text string if no physical image uploaded
             if (empty($img_path)) {
                 $img_path = $input['img_url'] ?? ($input['image_url'] ?? '');
+                // Clean the URL if it's a full URL
+                if (!empty($img_path) && strpos($img_path, 'http') === 0) {
+                    $parsed = parse_url($img_path);
+                    if (isset($parsed['path'])) {
+                        $img_path = ltrim($parsed['path'], '/');
+                    }
+                }
+                // Ensure it starts with 'uploads/'
+                if (!empty($img_path) && strpos($img_path, 'uploads/') !== 0) {
+                    $img_path = 'uploads/' . $img_path;
+                }
             }
 
-            // UPDATE CLIENT
             if ($id) {
                 $check_stmt = $pdo->prepare("SELECT * FROM clients WHERE id = ?");
                 $check_stmt->execute([$id]);
@@ -176,11 +215,10 @@ try {
                     exit();
                 }
 
-                $name = !empty($input['name']) ? trim((string)$input['name']) : $existing['name'];
-                $final_img = !empty($img_path) ? $img_path : ($existing['img_url'] ?? $existing['image_url'] ?? '');
+                $final_img = !empty($img_path) ? $img_path : ($existing['img_url'] ?? '');
 
-                $stmt = $pdo->prepare("UPDATE clients SET name = ?, img_url = ? WHERE id = ?");
-                $stmt->execute([$name, $final_img, $id]);
+                $stmt = $pdo->prepare("UPDATE clients SET img_url = ? WHERE id = ?");
+                $stmt->execute([$final_img, $id]);
 
                 $updated_stmt = $pdo->prepare("SELECT * FROM clients WHERE id = ?");
                 $updated_stmt->execute([$id]);
@@ -194,26 +232,32 @@ try {
                 break;
             }
 
-            // CREATE CLIENT
-            $name = trim((string)($input['name'] ?? ''));
-            if (empty($name)) {
+            if (empty($img_path)) {
                 http_response_code(400);
-                echo json_encode(["status" => "error", "message" => "Client name is required"]);
+                echo json_encode(["status" => "error", "message" => "Image file or image URL is required"]);
                 exit();
             }
 
-            $stmt = $pdo->prepare("INSERT INTO clients (name, img_url) VALUES (?, ?)");
-            $stmt->execute([$name, $img_path]);
+            $created_at = $input['created_at'] ?? $input['device_time'] ?? date('Y-m-d H:i:s');
+
+            $stmt = $pdo->prepare("INSERT INTO clients (img_url, created_at) VALUES (?, ?)");
+            $stmt->execute([$img_path, $created_at]);
 
             $new_id = (int)$pdo->lastInsertId();
             $new_stmt = $pdo->prepare("SELECT * FROM clients WHERE id = ?");
             $new_stmt->execute([$new_id]);
             $new_client = $new_stmt->fetch(PDO::FETCH_ASSOC);
 
+            $formatted_new = format_client_data($new_client);
+
             echo json_encode([
                 "status" => "success",
                 "message" => "Client added successfully",
-                "data" => format_client_data($new_client)
+                "id" => $new_id,
+                "img_url" => $formatted_new['img_url'],
+                "image_url" => $formatted_new['img_url'],
+                "img_path" => $new_client['img_url'],
+                "data" => $formatted_new
             ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             break;
 

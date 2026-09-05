@@ -40,14 +40,6 @@ function uploads_dir(): string {
         echo json_encode(["status" => "error", "message" => "Unable to create uploads directory."], JSON_UNESCAPED_SLASHES);
         exit();
     }
-    if (!is_writable($dir)) {
-        @chmod($dir, 0755);
-        if (!is_writable($dir)) {
-            http_response_code(500);
-            echo json_encode(["status" => "error", "message" => "Uploads directory is not writable."], JSON_UNESCAPED_SLASHES);
-            exit();
-        }
-    }
     return $dir;
 }
 
@@ -100,10 +92,16 @@ function public_image_url(string $value): string {
     return rtrim(api_base_url(), '/') . '/' . $value;
 }
 
-function resolve_photo_array(?string $photos_json): array {
-    $photos = json_decode($photos_json ?? '[]', true) ?: [];
+function resolve_photo_array($photos_raw): array {
+    if (is_string($photos_raw)) {
+        $photos = json_decode($photos_raw, true) ?: [];
+    } else if (is_array($photos_raw)) {
+        $photos = $photos_raw;
+    } else {
+        $photos = [];
+    }
+
     $formatted = [];
-    
     foreach ($photos as $img) {
         $url = public_image_url((string)$img);
         if ($url !== '') {
@@ -111,37 +109,6 @@ function resolve_photo_array(?string $photos_json): array {
         }
     }
     return $formatted;
-}
-
-function sanitize_status(string $status): string {
-    $status = trim($status);
-    return in_array($status, ['Draft', 'Published'], true) ? $status : 'Draft';
-}
-
-function uploaded_images(string $prefix): array {
-    $saved = [];
-    foreach (['photos', 'images', 'files', 'photo', 'image'] as $field) {
-        if (isset($_FILES[$field]) && is_array($_FILES[$field]['name'])) {
-            $count = count($_FILES[$field]['name']);
-            for ($i = 0; $i < $count; $i++) {
-                if (($_FILES[$field]['error'][$i] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK) {
-                    $file = [
-                        'name' => $_FILES[$field]['name'][$i],
-                        'type' => $_FILES[$field]['type'][$i],
-                        'tmp_name' => $_FILES[$field]['tmp_name'][$i],
-                        'error' => $_FILES[$field]['error'][$i],
-                        'size' => $_FILES[$field]['size'][$i]
-                    ];
-                    [$ok, $path] = save_uploaded_file($file, $prefix);
-                    if ($ok) $saved[] = $path;
-                }
-            }
-        } elseif (isset($_FILES[$field]) && ($_FILES[$field]['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK) {
-            [$ok, $path] = save_uploaded_file($_FILES[$field], $prefix);
-            if ($ok) $saved[] = $path;
-        }
-    }
-    return $saved;
 }
 
 function save_uploaded_file(array $file, string $prefix): array {
@@ -155,6 +122,34 @@ function save_uploaded_file(array $file, string $prefix): array {
     }
     @chmod($dest, 0644);
     return [true, 'uploads/' . $filename];
+}
+
+function uploaded_images(string $prefix): array {
+    $saved = [];
+    foreach (['photos', 'images', 'files', 'photo', 'image'] as $field) {
+        if (isset($_FILES[$field])) {
+            if (is_array($_FILES[$field]['name'])) {
+                $count = count($_FILES[$field]['name']);
+                for ($i = 0; $i < $count; $i++) {
+                    if (($_FILES[$field]['error'][$i] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK) {
+                        $file = [
+                            'name' => $_FILES[$field]['name'][$i],
+                            'type' => $_FILES[$field]['type'][$i],
+                            'tmp_name' => $_FILES[$field]['tmp_name'][$i],
+                            'error' => $_FILES[$field]['error'][$i],
+                            'size' => $_FILES[$field]['size'][$i]
+                        ];
+                        [$ok, $path] = save_uploaded_file($file, $prefix);
+                        if ($ok) $saved[] = $path;
+                    }
+                }
+            } elseif (($_FILES[$field]['error'] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_OK) {
+                [$ok, $path] = save_uploaded_file($_FILES[$field], $prefix);
+                if ($ok) $saved[] = $path;
+            }
+        }
+    }
+    return $saved;
 }
 
 function process_blog_photos(?string $existing_photos_json = null): string {
@@ -211,22 +206,8 @@ function process_blog_photos(?string $existing_photos_json = null): string {
             continue;
         }
 
-        $base = api_base_url();
-        if (strpos($img, $base) === 0) {
-            $img = substr($img, strlen($base));
-            $img = ltrim($img, '/');
-        }
-
         $img = str_replace('\\', '/', $img);
         $img = ltrim($img, '/');
-
-        $prefixes = ['bindu_decor/', 'api/bindu_decor/', 'uploads/uploads/'];
-        foreach ($prefixes as $prefix) {
-            if (stripos($img, $prefix) === 0) {
-                $img = substr($img, strlen($prefix));
-                break;
-            }
-        }
 
         if ($img !== '' && !in_array($img, $clean_photos, true)) {
             $clean_photos[] = $img;
@@ -234,18 +215,6 @@ function process_blog_photos(?string $existing_photos_json = null): string {
     }
 
     return json_encode(array_values(array_unique($clean_photos)), JSON_UNESCAPED_SLASHES);
-}
-
-function is_duplicate_title(PDO $pdo, string $title, $exclude_id = null): bool {
-    $sql = "SELECT COUNT(*) FROM blogs WHERE title = ?";
-    $params = [$title];
-    if ($exclude_id !== null) {
-        $sql .= " AND id != ?";
-        $params[] = $exclude_id;
-    }
-    $stmt = $pdo->prepare($sql);
-    $stmt->execute($params);
-    return (int)$stmt->fetchColumn() > 0;
 }
 
 $method = $_SERVER['REQUEST_METHOD'];
@@ -275,7 +244,9 @@ try {
             break;
 
         case 'POST':
-            $input = json_decode(file_get_contents("php://input"), true) ?? $_POST;
+            $raw_input = json_decode(file_get_contents("php://input"), true);
+            $input = is_array($raw_input) ? array_merge($_POST, $raw_input) : $_POST;
+
             $id = $input['id'] ?? ($_GET['id'] ?? null);
 
             if ($id) {
@@ -293,14 +264,8 @@ try {
                 $author_name = !empty($input['author_name']) ? trim((string)$input['author_name']) : $existing['author_name'];
                 $subject = isset($input['subject']) ? trim((string)$input['subject']) : $existing['subject'];
                 $description = isset($input['description']) ? trim((string)$input['description']) : $existing['description'];
+                $status = !empty($input['status']) ? trim((string)$input['status']) : $existing['status'];
 
-                if (is_duplicate_title($pdo, $title, $id)) {
-                    http_response_code(409);
-                    echo json_encode(["status" => "error", "message" => "A blog with this title already exists"]);
-                    exit();
-                }
-
-                $status = sanitize_status($input['status'] ?? $existing['status']);
                 $photos = process_blog_photos($existing['photos']);
 
                 $stmt = $pdo->prepare("UPDATE blogs SET title = ?, subject = ?, description = ?, author_name = ?, status = ?, photos = ? WHERE id = ?");
@@ -326,13 +291,7 @@ try {
                 exit();
             }
 
-            if (is_duplicate_title($pdo, $input['title'])) {
-                http_response_code(409);
-                echo json_encode(["status" => "error", "message" => "A blog with this title already exists"]);
-                exit();
-            }
-
-            $status = sanitize_status($input['status'] ?? 'Published');
+            $status = !empty($input['status']) ? trim((string)$input['status']) : 'Published';
             $photos = process_blog_photos(null);
 
             $stmt = $pdo->prepare("INSERT INTO blogs (title, subject, description, author_name, status, photos) VALUES (?, ?, ?, ?, ?, ?)");
