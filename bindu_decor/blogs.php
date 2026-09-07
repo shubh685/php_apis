@@ -1,6 +1,11 @@
 <?php
 declare(strict_types=1);
 
+// Prevent HTML/warnings from corrupting JSON output
+ob_start();
+ini_set('display_errors', '0');
+error_reporting(E_ALL);
+
 // =====================================================
 // CORS & HEADERS
 // =====================================================
@@ -16,6 +21,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 
 require_once __DIR__ . '/database.php';
 
+// =====================================================
+// HELPER FUNCTIONS
+// =====================================================
 function api_base_url(): string {
     $https = (!empty($_SERVER['HTTPS']) && strtolower($_SERVER['HTTPS']) !== 'off')
           || (isset($_SERVER['HTTP_X_FORWARDED_PROTO']) && $_SERVER['HTTP_X_FORWARDED_PROTO'] === 'https')
@@ -37,6 +45,7 @@ function uploads_dir(): string {
     $dir = __DIR__ . DIRECTORY_SEPARATOR . 'uploads' . DIRECTORY_SEPARATOR;
     if (!is_dir($dir) && !mkdir($dir, 0755, true)) {
         http_response_code(500);
+        ob_clean();
         echo json_encode(["status" => "error", "message" => "Unable to create uploads directory."], JSON_UNESCAPED_SLASHES);
         exit();
     }
@@ -173,7 +182,10 @@ function process_blog_photos(?string $existing_photos_json = null): string {
         }
     }
 
-    $input = json_decode(file_get_contents("php://input"), true) ?? [];
+    $raw_json = file_get_contents("php://input");
+    $input = !empty($raw_json) ? json_decode($raw_json, true) : [];
+    if (!is_array($input)) $input = [];
+
     $raw_photos = [];
     $sources = [$_POST, $_GET, $input];
 
@@ -217,6 +229,9 @@ function process_blog_photos(?string $existing_photos_json = null): string {
     return json_encode(array_values(array_unique($clean_photos)), JSON_UNESCAPED_SLASHES);
 }
 
+// =====================================================
+// MAIN ROUTER
+// =====================================================
 $method = $_SERVER['REQUEST_METHOD'];
 
 try {
@@ -228,9 +243,11 @@ try {
                 $blog = $stmt->fetch(PDO::FETCH_ASSOC);
                 if ($blog) {
                     $blog['photos'] = resolve_photo_array($blog['photos']);
+                    ob_clean();
                     echo json_encode(["status" => "success", "data" => $blog], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
                 } else {
                     http_response_code(404);
+                    ob_clean();
                     echo json_encode(["status" => "error", "message" => "Blog not found"]);
                 }
             } else {
@@ -239,12 +256,15 @@ try {
                 foreach ($blogs as &$blog) {
                     $blog['photos'] = resolve_photo_array($blog['photos']);
                 }
+                ob_clean();
                 echo json_encode(["status" => "success", "data" => $blogs], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
             }
             break;
 
         case 'POST':
-            $raw_input = json_decode(file_get_contents("php://input"), true);
+        case 'PUT':
+            $raw_json = file_get_contents("php://input");
+            $raw_input = !empty($raw_json) ? json_decode($raw_json, true) : [];
             $input = is_array($raw_input) ? array_merge($_POST, $raw_input) : $_POST;
 
             $id = $input['id'] ?? ($_GET['id'] ?? null);
@@ -256,6 +276,7 @@ try {
 
                 if (!$existing) {
                     http_response_code(404);
+                    ob_clean();
                     echo json_encode(["status" => "error", "message" => "Blog not found"]);
                     exit();
                 }
@@ -276,6 +297,7 @@ try {
                 $updated_blog = $updated_stmt->fetch(PDO::FETCH_ASSOC);
                 $updated_blog['photos'] = resolve_photo_array($updated_blog['photos']);
 
+                ob_clean();
                 echo json_encode([
                     "status" => "success",
                     "message" => "Blog updated successfully",
@@ -287,6 +309,7 @@ try {
 
             if (empty($input['title']) || empty($input['author_name'])) {
                 http_response_code(400);
+                ob_clean();
                 echo json_encode(["status" => "error", "message" => "Required fields missing: title and author_name are required"]);
                 exit();
             }
@@ -310,6 +333,7 @@ try {
             $new_blog = $new_stmt->fetch(PDO::FETCH_ASSOC);
             $new_blog['photos'] = resolve_photo_array($new_blog['photos']);
 
+            ob_clean();
             echo json_encode([
                 "status" => "success",
                 "message" => "Blog created successfully",
@@ -319,28 +343,36 @@ try {
             break;
 
         case 'DELETE':
-            $id = $_GET['id'] ?? (json_decode(file_get_contents("php://input"), true)['id'] ?? null);
+            $raw_json = file_get_contents("php://input");
+            $decoded = !empty($raw_json) ? json_decode($raw_json, true) : [];
+            $id = $_GET['id'] ?? ($decoded['id'] ?? null);
+
             if (!$id) {
                 http_response_code(400);
+                ob_clean();
                 echo json_encode(["status" => "error", "message" => "Blog ID is required"]);
                 exit();
             }
             
             $stmt = $pdo->prepare("DELETE FROM blogs WHERE id = ?");
             $stmt->execute([$id]);
+            ob_clean();
             echo json_encode(["status" => "success", "message" => "Blog deleted successfully"]);
             break;
 
         default:
             http_response_code(405);
+            ob_clean();
             echo json_encode(["status" => "error", "message" => "Method Not Allowed"]);
             break;
     }
 } catch (PDOException $e) {
     http_response_code(500);
+    ob_clean();
     echo json_encode(["status" => "error", "message" => "Database error: " . $e->getMessage()]);
-} catch (Exception $e) {
+} catch (Throwable $e) {
     http_response_code(500);
+    ob_clean();
     echo json_encode(["status" => "error", "message" => "Server error: " . $e->getMessage()]);
 }
 ?>

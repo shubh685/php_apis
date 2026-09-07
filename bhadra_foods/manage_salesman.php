@@ -42,8 +42,19 @@ function generateEmpId($db, $role) {
 switch($method) {
     case 'GET':
         try {
-            $query = "SELECT id, name, emp_id, mobile, email, city, assigned_route, is_live, last_updated, role FROM users WHERE role != 'admin' ORDER BY id DESC";
-            $stmt = $db->prepare($query);
+            $emp_id = isset($_GET['emp_id']) ? $_GET['emp_id'] : '';
+            
+            if(!empty($emp_id)) {
+                $query = "SELECT id, name, emp_id, mobile, email, city, assigned_route, is_live,  last_updated, role 
+                          FROM users WHERE emp_id = :emp_id LIMIT 1";
+                $stmt = $db->prepare($query);
+                $stmt->bindParam(":emp_id", $emp_id);
+            } else {
+                $query = "SELECT id, name, emp_id, mobile, email, city, assigned_route, is_live,  last_updated, role 
+                          FROM users WHERE role != 'admin' ORDER BY id DESC";
+                $stmt = $db->prepare($query);
+            }
+            
             $stmt->execute();
             $users = $stmt->fetchAll(PDO::FETCH_ASSOC);
             

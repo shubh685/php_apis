@@ -4,6 +4,11 @@ header("Access-Control-Allow-Headers: Content-Type, Authorization");
 header("Access-Control-Allow-Methods: POST, GET, OPTIONS");
 header("Content-Type: application/json; charset=UTF-8");
 
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit();
+}
+
 require_once "data.php";
 
 $database = new Database();
@@ -17,7 +22,12 @@ error_log("Change Password Request: " . print_r($data, true));
 
 // Check if required fields exist
 if(empty($data['identifier'])) {
-    echo json_encode(["status" => false, "message" => "Identifier (emp_id/mobile/email) is required"]);
+    echo json_encode(["status" => false, "message" => "Identifier (emp_id/mobile/email/username) is required"]);
+    exit();
+}
+
+if(empty($data['role'])) {
+    echo json_encode(["status" => false, "message" => "Role is required"]);
     exit();
 }
 
@@ -32,8 +42,9 @@ if(empty($data['new_password'])) {
 }
 
 $identifier = $data['identifier'];
-$old_pwd = $data['old_password'];
-$new_pwd = $data['new_password'];
+$role       = $data['role'];
+$old_pwd    = $data['old_password'];
+$new_pwd    = $data['new_password'];
 
 // Validate new password length
 if(strlen($new_pwd) < 4) {
@@ -42,19 +53,23 @@ if(strlen($new_pwd) < 4) {
 }
 
 try {
-    // Find user by emp_id, mobile, or email
-    $query = "SELECT id, password FROM users WHERE emp_id = :id OR mobile = :id OR email = :id LIMIT 1";
+    // Find user by emp_id, name, mobile, or email AND verify matching role
+    $query = "SELECT id, password, role FROM users 
+              WHERE (emp_id = :id OR name = :id OR mobile = :id OR email = :id) 
+              AND role = :role 
+              LIMIT 1";
+              
     $stmt = $db->prepare($query);
     $stmt->bindParam(":id", $identifier);
+    $stmt->bindParam(":role", $role);
     $stmt->execute();
 
     if($stmt->rowCount() > 0) {
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         
-        // Verify current password (supports bcrypt or plain text)
+        // Verify current password (supports bcrypt or plain text fallback)
         $passwordValid = false;
         
-        // Check if password is hashed with bcrypt
         if(password_get_info($row['password'])['algo'] !== 0) {
             // Password is hashed with bcrypt
             $passwordValid = password_verify($old_pwd, $row['password']);
@@ -64,7 +79,7 @@ try {
         }
         
         if($passwordValid) {
-            // Hash new password
+            // Hash new password using bcrypt
             $hashed_new_pwd = password_hash($new_pwd, PASSWORD_BCRYPT);
             
             // Update password
@@ -82,10 +97,10 @@ try {
             echo json_encode(["status" => false, "message" => "Incorrect current password"]);
         }
     } else {
-        echo json_encode(["status" => false, "message" => "User record not found with identifier: $identifier"]);
+        echo json_encode(["status" => false, "message" => "User record not found for identifier: $identifier with role: $role"]);
     }
 } catch (Exception $e) {
     error_log("Change Password Error: " . $e->getMessage());
     echo json_encode(["status" => false, "message" => "Database error: " . $e->getMessage()]);
 }
-?>ssssssssss
+?>

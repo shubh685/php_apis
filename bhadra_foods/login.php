@@ -1,94 +1,51 @@
 <?php
-// login.php
 header("Access-Control-Allow-Origin: *");
-header("Access-Control-Allow-Headers: Content-Type, Authorization");
-header("Access-Control-Allow-Methods: POST, GET, OPTIONS");
-header("Content-Type: application/json");
 header("Content-Type: application/json; charset=UTF-8");
+header("Access-Control-Allow-Methods: POST");
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
-    http_response_code(200);
+$conn = new mysqli("localhost", "root", "", "bhadra_foods");
+
+if ($conn->connect_error) {
+    echo json_encode(["status" => "error", "message" => "Database connection failed"]);
     exit();
 }
 
-require_once 'data.php';
+$data = json_decode(file_get_contents("php://input"), true);
 
-$database = new Database();
-$db = $database->getConnection();
+$username = $data['username'] ?? '';
+$password = $data['password'] ?? '';
+$role     = $data['role'] ?? '';
 
-if (!$db) {
-    http_response_code(500);
-    echo json_encode([
-        "status" => "error",
-        "message" => "Database connection failed."
-    ]);
+if (empty($username) || empty($password) || empty($role)) {
+    echo json_encode(["status" => "error", "message" => "Missing required fields"]);
     exit();
 }
 
-// Receive JSON raw post input
-$data = json_decode(file_get_contents("php://input"));
+// Ensure you query the column storing the Employee ID (e.g., emp_id or id)
+$stmt = $conn->prepare("SELECT id AS emp_id, name, email, password FROM users WHERE (email = ? OR name = ?) LIMIT 1");
+$stmt->bind_param("ss", $username, $username);
+$stmt->execute();
+$result = $stmt->get_result();
 
-if (!empty($data->role) && !empty($data->username) && !empty($data->password)) {
-    $role = trim($data->role);
-    $username = trim($data->username);
-    $password = trim($data->password);
-
-    try {
-        // Query users table matching role and (email OR mobile)
-        $query = "SELECT id, emp_id, name, email, mobile, password, role 
-                  FROM users 
-                  WHERE role = :role AND (email = :username OR mobile = :username) 
-                  LIMIT 1";
-
-        $stmt = $db->prepare($query);
-        $stmt->bindParam(":role", $role);
-        $stmt->bindParam(":username", $username);
-        $stmt->execute();
-
-        if ($stmt->rowCount() > 0) {
-            $row = $stmt->fetch();
-
-            // Password Verification (Supports hashed or plaintext passwords)
-            if (password_verify($password, $row['password']) || $password === $row['password']) {
-                http_response_code(200);
-                echo json_encode([
-                    "status" => "success",
-                    "message" => "Login successful",
-                    "user" => [
-                        "id" => $row['id'],
-                        "emp_id" => $row['emp_id'] ?? ("EMP-" . $row['id']), // Returns emp_id for Salesman / Super Stockiest roles
-                        "name" => $row['name'],
-                        "email" => $row['email'],
-                        "mobile" => $row['mobile'],
-                        "role" => $row['role']
-                    ]
-                ]);
-            } else {
-                http_response_code(401);
-                echo json_encode([
-                    "status" => "error",
-                    "message" => "Invalid credentials. Password incorrect."
-                ]);
-            }
-        } else {
-            http_response_code(404);
-            echo json_encode([
-                "status" => "error",
-                "message" => "No account found matching the given role and credentials."
-            ]);
-        }
-    } catch (PDOException $e) {
-        http_response_code(500);
+if ($user = $result->fetch_assoc()) {
+    // Note: Use password_verify($password, $user['password']) in production
+    if ($password === $user['password'] || password_verify($password, $user['password'])) {
         echo json_encode([
-            "status" => "error",
-            "message" => "Query Error: " . $e->getMessage()
+            "status" => "success",
+            "message" => "Login successful",
+            "user" => [
+                "emp_id" => (string)$user['emp_id'],
+                "name" => $user['name'],
+                "email" => $user['email'],
+                "role" => $role
+            ]
         ]);
+    } else {
+        echo json_encode(["status" => "error", "message" => "Invalid credentials"]);
     }
 } else {
-    http_response_code(400);
-    echo json_encode([
-        "status" => "error",
-        "message" => "Incomplete data provided. Role, username/mobile, and password are required."
-    ]);
+    echo json_encode(["status" => "error", "message" => "User not found"]);
 }
+
+$conn->close();
 ?>
