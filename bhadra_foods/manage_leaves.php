@@ -1,6 +1,7 @@
 <?php
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Methods: GET, POST, PUT, OPTIONS");
+header("Access-Control-Allow-Headers: Content-Type, Authorization");
 header("Content-Type: application/json; charset=UTF-8");
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -11,21 +12,34 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
 $conn = new mysqli("localhost", "root", "", "bhadra_foods");
 
 if ($conn->connect_error) {
-    echo json_encode(["status" => "error", "message" => "Database connection failed"]);
+    echo json_encode(["status" => false, "message" => "Database connection failed"]);
     exit();
 }
 
 $method = $_SERVER['REQUEST_METHOD'];
 
 if ($method === 'GET') {
-    $emp_id = $_GET['emp_id'] ?? '';
-    if (empty($emp_id)) {
-        echo json_encode(["status" => "error", "message" => "emp_id is required"]);
-        exit();
+    $emp_id = $_GET['emp_id'] ?? 'all';
+    
+    // Checks if table 'manage_leaves' or 'leaves' exists
+    if ($emp_id === 'all' || empty($emp_id)) {
+        $query = "SELECT l.id, l.emp_id, COALESCE(s.name, 'Staff') AS emp_name, COALESCE(s.role, 'Salesman') AS emp_role, 
+                         l.leave_type, l.start_date, l.end_date, l.reason, l.status, l.created_at 
+                  FROM manage_leaves l 
+                  LEFT JOIN manage_salesmna s ON l.emp_id = s.emp_id 
+                  ORDER BY l.id DESC";
+        $stmt = $conn->prepare($query);
+    } else {
+        $query = "SELECT l.id, l.emp_id, COALESCE(s.name, 'Staff') AS emp_name, COALESCE(s.role, 'Salesman') AS emp_role, 
+                         l.leave_type, l.start_date, l.end_date, l.reason, l.status, l.created_at 
+                  FROM manage_leaves l 
+                  LEFT JOIN manage_salesmna s ON l.emp_id = s.emp_id 
+                  WHERE l.emp_id = ? 
+                  ORDER BY l.id DESC";
+        $stmt = $conn->prepare($query);
+        $stmt->bind_param("s", $emp_id);
     }
 
-    $stmt = $conn->prepare("SELECT id, emp_id, leave_type, start_date, end_date, reason, status, created_at FROM leaves WHERE emp_id = ? ORDER BY id DESC");
-    $stmt->bind_param("s", $emp_id);
     $stmt->execute();
     $result = $stmt->get_result();
 
@@ -34,75 +48,26 @@ if ($method === 'GET') {
         $leaves[] = $row;
     }
 
-    echo json_encode(["status" => "success", "leaves" => $leaves]);
-
-} elseif ($method === 'POST') {
-    $emp_id = $_POST['emp_id'] ?? '';
-    $leave_type = $_POST['leave_type'] ?? '';
-    $start_date = $_POST['start_date'] ?? '';
-    $end_date = $_POST['end_date'] ?? '';
-    $reason = $_POST['reason'] ?? '';
-
-    if (empty($emp_id) || empty($leave_type) || empty($start_date) || empty($end_date) || empty($reason)) {
-        echo json_encode(["status" => "error", "message" => "All fields are required"]);
-        exit();
-    }
-
-    $stmt = $conn->prepare("INSERT INTO leaves (emp_id, leave_type, start_date, end_date, reason, status) VALUES (?, ?, ?, ?, ?, 'Pending')");
-    $stmt->bind_param("sssss", $emp_id, $leave_type, $start_date, $end_date, $reason);
-
-    if ($stmt->execute()) {
-        echo json_encode(["status" => "success", "message" => "Leave application submitted successfully"]);
-    } else {
-        echo json_encode(["status" => "error", "message" => "Failed to save leave request: " . $stmt->error]);
-    }
-
+    echo json_encode([
+        "status" => true,
+        "leaves" => $leaves
+    ]);
 } elseif ($method === 'PUT') {
-    // For updating leave status (Approve/Reject)
-    $input = json_decode(file_get_contents("php://input"), true);
-    
-    $leave_id = $input['leave_id'] ?? '';
-    $status = $input['status'] ?? '';
-    $emp_id = $input['emp_id'] ?? '';
+    $data = json_decode(file_get_contents("php://input"), true);
+    $leave_id = $data['leave_id'] ?? '';
+    $status = $data['status'] ?? '';
 
-    if (empty($leave_id) || empty($status) || empty($emp_id)) {
-        echo json_encode(["status" => "error", "message" => "leave_id, emp_id and status are required"]);
-        exit();
-    }
-
-    if (!in_array($status, ['Approved', 'Rejected'])) {
-        echo json_encode(["status" => "error", "message" => "Invalid status. Use 'Approved' or 'Rejected'"]);
-        exit();
-    }
-
-    // Verify that the leave belongs to the employee
-    $verifyStmt = $conn->prepare("SELECT id FROM leaves WHERE id = ? AND emp_id = ?");
-    $verifyStmt->bind_param("is", $leave_id, $emp_id);
-    $verifyStmt->execute();
-    $verifyResult = $verifyStmt->get_result();
-
-    if ($verifyResult->num_rows === 0) {
-        echo json_encode(["status" => "error", "message" => "Leave request not found for this employee"]);
-        exit();
-    }
-
-    $stmt = $conn->prepare("UPDATE leaves SET status = ? WHERE id = ? AND emp_id = ?");
-    $stmt->bind_param("sis", $status, $leave_id, $emp_id);
-
-    if ($stmt->execute()) {
-        echo json_encode([
-            "status" => "success", 
-            "message" => "Leave $status successfully",
-            "leave_id" => $leave_id,
-            "new_status" => $status
-        ]);
+    if (!empty($leave_id) && !empty($status)) {
+        $stmt = $conn->prepare("UPDATE manage_leaves SET status = ? WHERE id = ?");
+        $stmt->bind_param("si", $status, $leave_id);
+        if ($stmt->execute()) {
+            echo json_encode(["status" => true, "message" => "Leave updated successfully"]);
+        } else {
+            echo json_encode(["status" => false, "message" => "Failed to update leave"]);
+        }
     } else {
-        echo json_encode(["status" => "error", "message" => "Failed to update leave status: " . $stmt->error]);
+        echo json_encode(["status" => false, "message" => "Invalid parameters"]);
     }
-
-} else {
-    echo json_encode(["status" => "error", "message" => "Invalid HTTP Method"]);
 }
-
 $conn->close();
 ?>

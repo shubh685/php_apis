@@ -13,7 +13,7 @@ $method = $_SERVER['REQUEST_METHOD'];
 
 function generateEmpId($db, $role) {
     $prefixes = [
-        'Salesman'     => 'BHFSM',
+        'Salesman'      => 'BHFSM',
         'Sales Officer' => 'BHFSO',
         'ASM'           => 'BHFAS',
         'RSM'           => 'BHFRS',
@@ -31,11 +31,11 @@ function generateEmpId($db, $role) {
         
         $total = isset($row['total']) ? intval($row['total']) : 0;
         $nextNumber = str_pad($total + 1, 2, '0', STR_PAD_LEFT);
-        return $prefix . ':-' . $nextNumber;
+        return $prefix . '-' . $nextNumber;
     } catch (Exception $e) {
         $timestamp = time();
         $lastTwoDigits = substr($timestamp, -2);
-        return $prefix . ':-' . $lastTwoDigits;
+        return $prefix . '-' . $lastTwoDigits;
     }
 }
 
@@ -45,12 +45,12 @@ switch($method) {
             $emp_id = isset($_GET['emp_id']) ? $_GET['emp_id'] : '';
             
             if(!empty($emp_id)) {
-                $query = "SELECT id, name, emp_id, mobile, email, city, assigned_route, is_live,  last_updated, role 
+                $query = "SELECT id, name, emp_id, mobile, email, city, assigned_route, is_live, last_updated, role 
                           FROM users WHERE emp_id = :emp_id LIMIT 1";
                 $stmt = $db->prepare($query);
                 $stmt->bindParam(":emp_id", $emp_id);
             } else {
-                $query = "SELECT id, name, emp_id, mobile, email, city, assigned_route, is_live,  last_updated, role 
+                $query = "SELECT id, name, emp_id, mobile, email, city, assigned_route, is_live, last_updated, role 
                           FROM users WHERE role != 'admin' ORDER BY id DESC";
                 $stmt = $db->prepare($query);
             }
@@ -61,16 +61,16 @@ switch($method) {
             foreach($users as &$user) {
                 if(!isset($user['emp_id']) || empty($user['emp_id']) || $user['emp_id'] === '0') {
                     $prefixes = [
-                        'Salesman' => 'BHFSM',
+                        'Salesman'      => 'BHFSM',
                         'Sales Officer' => 'BHFSO',
-                        'ASM' => 'BHFAS',
-                        'RSM' => 'BHFRS',
-                        'ZSM' => 'BHFZS',
-                        'Sales Head' => 'BHFSH'
+                        'ASM'           => 'BHFAS',
+                        'RSM'           => 'BHFRS',
+                        'ZSM'           => 'BHFZS',
+                        'Sales Head'    => 'BHFSH'
                     ];
                     $prefix = isset($prefixes[$user['role']]) ? $prefixes[$user['role']] : 'BHFEMP';
                     $id = isset($user['id']) ? intval($user['id']) : 0;
-                    $generated_emp_id = $prefix . ':-' . str_pad($id, 2, '0', STR_PAD_LEFT);
+                    $generated_emp_id = $prefix . '-' . str_pad($id, 2, '0', STR_PAD_LEFT);
                     
                     try {
                         $updateQuery = "UPDATE users SET emp_id = :emp_id WHERE id = :id";
