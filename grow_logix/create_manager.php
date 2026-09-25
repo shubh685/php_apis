@@ -1,8 +1,13 @@
 <?php
 header("Access-Control-Allow-Origin: *");
 header("Content-Type: application/json; charset=UTF-8");
-header("Access-Control-Allow-Methods: POST");
+header("Access-Control-Allow-Methods: POST, OPTIONS");
 header("Access-Control-Allow-Headers: Content-Type, Access-Control-Allow-Headers, Authorization, X-Requested-With");
+
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit(0);
+}
 
 // Database Configuration
 $host = "localhost";
@@ -20,9 +25,10 @@ try {
 
 $data = json_decode(file_get_contents("php://input"));
 
-if (!empty($data->manager_name) && !empty($data->email) && !empty($data->password)) {
-    $manager_name = trim($data->manager_name);
+if (!empty($data->name) && !empty($data->email) && !empty($data->password)) {
+    $name = trim($data->name);
     $email = trim($data->email);
+    $mobile = !empty($data->mobile) ? trim($data->mobile) : '';
     $hashed_password = password_hash($data->password, PASSWORD_BCRYPT);
     $role = "Manager";
 
@@ -38,12 +44,13 @@ if (!empty($data->manager_name) && !empty($data->email) && !empty($data->passwor
         exit();
     }
 
-    // Insert Manager Record
-    $query = "INSERT INTO users (manager_name, email, password, role) VALUES (:manager_name, :email, :password, :role)";
+    // Insert Manager Record with mobile
+    $query = "INSERT INTO users (name, email, mobile, password, role) VALUES (:name, :email, :mobile, :password, :role)";
     $stmt = $conn->prepare($query);
 
-    $stmt->bindParam(":manager_name", $manager_name);
+    $stmt->bindParam(":name", $name);
     $stmt->bindParam(":email", $email);
+    $stmt->bindParam(":mobile", $mobile);
     $stmt->bindParam(":password", $hashed_password);
     $stmt->bindParam(":role", $role);
 
@@ -54,8 +61,9 @@ if (!empty($data->manager_name) && !empty($data->email) && !empty($data->passwor
             "message" => "Manager account created successfully.",
             "data" => [
                 "id" => $conn->lastInsertId(),
-                "manager_name" => $manager_name,
+                "name" => $name,
                 "email" => $email,
+                "mobile" => $mobile,
                 "role" => $role
             ]
         ]);
