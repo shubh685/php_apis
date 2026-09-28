@@ -4,47 +4,134 @@ error_reporting(E_ALL);
 ini_set('display_errors', 0);
 ini_set('log_errors', 1);
 
-// ==================== CORS HEADERS ====================
+// Ensure fatal errors still return JSON
+register_shutdown_function(function () {
+    $err = error_get_last();
+    if ($err && in_array($err['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR])) {
+        if (!headers_sent()) {
+            http_response_code(500);
+            header('Content-Type: application/json; charset=utf-8');
+        }
+        echo json_encode([
+            "status"  => "error",
+            "message" => "PHP fatal: " . $err['message'],
+            "file"    => basename($err['file'] ?? ''),
+            "line"    => $err['line'] ?? 0
+        ]);
+    }
+});
+
+// ==================== CORS ====================
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Headers: Content-Type, Accept, Authorization");
 header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
 header("Content-Type: application/json; charset=utf-8");
 
-if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+if (($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') {
     http_response_code(200);
     exit;
 }
 
+// ==================== HELPERS ====================
 function sendResponse($data, $httpCode = 200) {
     http_response_code($httpCode);
     echo json_encode($data);
     exit;
 }
-
 function sendError($message, $httpCode = 400) {
     sendResponse(["status" => "error", "message" => $message], $httpCode);
 }
+function normalizeEmpId($id) {
+    if (!is_string($id) && !is_numeric($id)) return '';
+    return strtoupper(trim((string)$id));
+}
+function normalizeAction($a) {
+    if (!is_string($a) && !is_numeric($a)) return '';
+    return strtolower(trim((string)$a));
+}
 
 // ==================== DB CONNECTION ====================
-$host = "localhost";
-$user = "root";
-$pass = "";
-$db   = "grow_logix";
+$host     = "localhost";
+$dbname   = "grow_logix";
+$username = "root";
+$password = "";
 
-$conn = new mysqli($host, $user, $pass, $db);
+mysqli_report(MYSQLI_REPORT_OFF);
+$conn = @new mysqli($host, $username, $password, $dbname);
 
 if ($conn->connect_error) {
     sendError("Database connection failed: " . $conn->connect_error, 500);
 }
-
 $conn->set_charset("utf8mb4");
-@$conn->query("SET SESSION max_allowed_packet = 67108864"); // 64 MB
 
-// ==================== AUTO-MIGRATE USERS TABLE (heartbeat) ====================
+try {
+    @$conn->query("SET SESSION max_allowed_packet = 67108864"); // 64 MB
+} catch (Throwable $e) {
+    // ignore
+}
+
+// ==================== MONTH-END RETENTION PURGE ====================
+/**
+ * Deletes live_stream_history rows older than "first day of previous month"
+ * once we have reached the 10th (or later) of the current month.
+ *
+ * Examples (today = 2026-09-25, cutoff = 2026-09-10):
+ *   - Keeps anything from 2026-08-01 onwards.
+ *   - Deletes anything before 2026-08-01.
+ *
+ * Examples (today = 2026-09-05, cutoff = 2026-08-10):
+ *   - Keeps anything from 2026-07-01 onwards.
+ *   - Deletes anything before 2026-07-01.
+ *
+ * Works correctly for 28 / 29 / 30 / 31-day months and all years,
+ * because we rely on PHP's strtotime() which is calendar-aware.
+ */
+function cleanupMonthlyHistory($conn, $empId = null, $force = false) {
+    if (!$force) {
+        $lockFile = sys_get_temp_dir() . '/gl_history_cleanup.lock';
+        if (file_exists($lockFile) && (time() - filemtime($lockFile)) < 3600) {
+            return;
+        }
+        @touch($lockFile);
+    }
+
+    $currentDay = (int)date('j');
+
+    if ($currentDay >= 10) {
+        // We're at/after the 10th → keep only current + previous month
+        $cutoffDate = date('Y-m-01 00:00:00');
+        $cutoffDate = date('Y-m-01 00:00:00', strtotime($cutoffDate . ' -1 month'));
+    } else {
+        // Before the 10th → also keep the month before previous
+        $cutoffDate = date('Y-m-01 00:00:00', strtotime('first day of last month'));
+        $cutoffDate = date('Y-m-01 00:00:00', strtotime($cutoffDate . ' -1 month'));
+    }
+
+    if (!empty($empId)) {
+        $stmt = $conn->prepare("DELETE FROM live_stream_history WHERE emp_id = ? AND captured_at < ?");
+        if ($stmt) {
+            $stmt->bind_param("ss", $empId, $cutoffDate);
+            @$stmt->execute();
+            $stmt->close();
+        }
+    } else {
+        $stmt = $conn->prepare("DELETE FROM live_stream_history WHERE captured_at < ?");
+        if ($stmt) {
+            $stmt->bind_param("s", $cutoffDate);
+            @$stmt->execute();
+            $stmt->close();
+        }
+    }
+}
+
+cleanupMonthlyHistory($conn, null, false);
+
+// ==================== AUTO-MIGRATE SCHEMAS ====================
 @$conn->query("ALTER TABLE `users` ADD COLUMN `last_heartbeat` DATETIME DEFAULT NULL");
 @$conn->query("ALTER TABLE `users` ADD COLUMN `app_running` TINYINT(1) DEFAULT 0");
+@$conn->query("ALTER TABLE `users` ADD COLUMN `device_id` VARCHAR(191) DEFAULT NULL");
+@$conn->query("ALTER TABLE `users` ADD COLUMN `computer_name` VARCHAR(191) DEFAULT NULL");
 
-// ==================== AUTO-CREATE / MIGRATE live_stream ====================
 $conn->query("
 CREATE TABLE IF NOT EXISTS `live_stream` (
   `id` INT AUTO_INCREMENT PRIMARY KEY,
@@ -62,14 +149,12 @@ CREATE TABLE IF NOT EXISTS `live_stream` (
   INDEX `idx_updated` (`updated_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ");
-
 @$conn->query("ALTER TABLE `live_stream` ADD COLUMN `pc_type` VARCHAR(20) DEFAULT 'personal'");
 @$conn->query("ALTER TABLE `live_stream` ADD COLUMN `pc_number` VARCHAR(50) DEFAULT 'Personal PC'");
 @$conn->query("ALTER TABLE `live_stream` ADD COLUMN `window_title` VARCHAR(255) DEFAULT NULL");
 @$conn->query("ALTER TABLE `live_stream` ADD COLUMN `captured_at` DATETIME DEFAULT CURRENT_TIMESTAMP");
 @$conn->query("ALTER TABLE `live_stream` ADD COLUMN `frame_counter` BIGINT DEFAULT 0");
 
-// ==================== AUTO-CREATE / MIGRATE live_stream_history ====================
 $conn->query("
 CREATE TABLE IF NOT EXISTS `live_stream_history` (
   `id` INT AUTO_INCREMENT PRIMARY KEY,
@@ -77,15 +162,29 @@ CREATE TABLE IF NOT EXISTS `live_stream_history` (
   `image_base64` LONGTEXT NULL,
   `captured_at` DATETIME DEFAULT CURRENT_TIMESTAMP,
   `window_title` VARCHAR(255) DEFAULT NULL,
-  INDEX `idx_emp_time` (`emp_id`, `captured_at`)
+  INDEX `idx_emp_time` (`emp_id`, `captured_at`),
+  INDEX `idx_captured_at` (`captured_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+");
+@$conn->query("ALTER TABLE `live_stream_history` ADD COLUMN `window_title` VARCHAR(255) DEFAULT NULL");
+@$conn->query("ALTER TABLE `live_stream_history` ADD INDEX `idx_captured_at` (`captured_at`)");
+
+$conn->query("
+CREATE TABLE IF NOT EXISTS `devices` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `device_id` VARCHAR(191) NOT NULL UNIQUE,
+  `device_name` VARCHAR(191) DEFAULT 'Company PC',
+  `pc_number` VARCHAR(50) DEFAULT NULL,
+  `emp_id` VARCHAR(50) DEFAULT NULL,
+  `assigned_user_id` INT DEFAULT NULL,
+  `last_login_at` DATETIME DEFAULT NULL,
+  INDEX `idx_device_id` (`device_id`),
+  INDEX `idx_emp_id` (`emp_id`),
+  INDEX `idx_assigned_user` (`assigned_user_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 ");
 
-@$conn->query("ALTER TABLE `live_stream_history` ADD COLUMN `window_title` VARCHAR(255) DEFAULT NULL");
-
-$action = $_GET['action'] ?? '';
-$method = $_SERVER['REQUEST_METHOD'];
-
+// ==================== REQUEST PARSING ====================
 $rawInput = file_get_contents('php://input');
 $input = [];
 if (!empty($rawInput)) {
@@ -94,8 +193,49 @@ if (!empty($rawInput)) {
 }
 if (empty($input) && !empty($_POST)) $input = $_POST;
 
-function normalizeEmpId($id) {
-    return strtoupper(trim($id));
+$action = normalizeAction(
+    $_GET['action'] ?? $_POST['action'] ?? $input['action'] ?? ''
+);
+$method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+
+// ==================== DEVICE RESOLUTION ====================
+function fetchDeviceForUser($conn, $userEmpId, $userId) {
+    $sql = "
+        SELECT device_id, device_name, pc_number, last_login_at
+        FROM devices
+        WHERE assigned_user_id = ?
+           OR emp_id = ?
+        ORDER BY last_login_at DESC
+        LIMIT 1
+    ";
+    $stmt = $conn->prepare($sql);
+    if (!$stmt) return null;
+    $empIdVal  = $userEmpId ?? '';
+    $userIdVal = (int)$userId;
+    $stmt->bind_param("is", $userIdVal, $empIdVal);
+    $stmt->execute();
+    $res = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
+    return $res ?: null;
+}
+
+function resolvePcInfo($userRole, $device) {
+    $isManager = (strcasecmp($userRole ?? '', 'Manager') === 0);
+    $pcNumber  = 'Personal PC';
+    $pcType    = 'personal';
+
+    if ($device && !empty($device['pc_number'])) {
+        $raw = trim((string)$device['pc_number']);
+        if ($raw !== '' && strtolower($raw) !== 'null') {
+            $pcNumber = 'PC-' . $raw;
+            $pcType   = 'office';
+        }
+    }
+    if ($isManager) {
+        $pcType   = 'personal';
+        $pcNumber = 'Personal PC';
+    }
+    return [$pcType, $pcNumber];
 }
 
 // ==================== HEARTBEAT ====================
@@ -104,14 +244,14 @@ if ($action === 'heartbeat' && $method === 'POST') {
     if (empty($emp_id)) sendError("Employee ID required", 400);
 
     $stmt = $conn->prepare("
-        UPDATE users 
-        SET last_heartbeat = NOW(),
-            app_running = 1,
-            updated_at = NOW()
+        UPDATE users
+        SET last_heartbeat = NOW(), app_running = 1, updated_at = NOW()
         WHERE UPPER(emp_id) = ?
     ");
+    if (!$stmt) sendError("DB prepare failed: " . $conn->error, 500);
     $stmt->bind_param("s", $emp_id);
     $stmt->execute();
+    $stmt->close();
 
     sendResponse(["status" => "success", "message" => "Heartbeat received"]);
 }
@@ -122,39 +262,40 @@ if ($action === 'app_shutdown' && $method === 'POST') {
     if (empty($emp_id)) sendError("Employee ID required", 400);
 
     $stmt = $conn->prepare("
-        UPDATE users 
-        SET app_running = 0,
-            updated_at = NOW()
+        UPDATE users
+        SET app_running = 0, updated_at = NOW()
         WHERE UPPER(emp_id) = ?
     ");
+    if (!$stmt) sendError("DB prepare failed: " . $conn->error, 500);
     $stmt->bind_param("s", $emp_id);
     $stmt->execute();
+    $stmt->close();
 
     sendResponse(["status" => "success", "message" => "App shutdown noted"]);
 }
 
 // ==================== VERIFY PC TYPE ====================
 if ($action === 'verify_pc_type' && $method === 'POST') {
-    $emp_id = normalizeEmpId($input['emp_id'] ?? '');
+    $emp_id  = normalizeEmpId($input['emp_id'] ?? '');
     $pc_type = $input['pc_type'] ?? 'personal';
-
     if (empty($emp_id)) sendError("Employee ID required", 400);
 
-    $stmt = $conn->prepare("
-        SELECT u.device_id, u.computer_name,
-               d.pc_number AS office_pc_number,
-               d.device_name AS office_device_name
+    $userStmt = $conn->prepare("
+        SELECT u.id, u.emp_id, u.role, u.device_id, u.computer_name,
+               d.pc_number AS office_pc_number, d.device_name AS office_device_name
         FROM users u
         LEFT JOIN devices d ON d.device_id = u.device_id
         WHERE UPPER(u.emp_id) = ?
         LIMIT 1
     ");
-    $stmt->bind_param("s", $emp_id);
-    $stmt->execute();
-    $user = $stmt->get_result()->fetch_assoc();
+    if (!$userStmt) sendError("DB prepare failed: " . $conn->error, 500);
+    $userStmt->bind_param("s", $emp_id);
+    $userStmt->execute();
+    $user = $userStmt->get_result()->fetch_assoc();
+    $userStmt->close();
 
-    $pcNumber = 'Personal PC';
-    $finalPcType = $pc_type;
+    $pcNumber    = 'Personal PC';
+    $finalPcType = 'personal';
 
     if ($pc_type === 'office') {
         if ($user && !empty($user['office_pc_number'])) {
@@ -177,100 +318,122 @@ if ($action === 'verify_pc_type' && $method === 'POST') {
             pc_number = VALUES(pc_number),
             updated_at = NOW()
     ");
+    if (!$upStmt) sendError("DB prepare failed: " . $conn->error, 500);
     $upStmt->bind_param("sss", $emp_id, $finalPcType, $pcNumber);
     @$upStmt->execute();
+    $upStmt->close();
 
     sendResponse([
-        "status" => "success",
-        "pc_type" => $finalPcType,
+        "status"    => "success",
+        "pc_type"   => $finalPcType,
         "pc_number" => $pcNumber
     ]);
 }
 
-// ==================== 1. SEND LIVE REQUEST (Manager) ====================
+// ==================== 1. SEND LIVE REQUEST ====================
 if ($action === 'send_live_request' && $method === 'POST') {
     $emp_id = normalizeEmpId($input['emp_id'] ?? '');
     if (empty($emp_id)) sendError("Employee ID required", 400);
 
     $userStmt = $conn->prepare("
-        SELECT u.id, u.name, u.device_id, u.computer_name, u.is_active, u.updated_at,
-               d.pc_number AS office_pc_number,
-               d.device_name AS office_device_name
+        SELECT u.id, u.name, u.device_id, u.computer_name,
+               d.pc_number AS office_pc_number
         FROM users u
         LEFT JOIN devices d ON d.device_id = u.device_id
         WHERE UPPER(u.emp_id) = ?
         LIMIT 1
     ");
+    if (!$userStmt) sendError("DB prepare failed: " . $conn->error, 500);
     $userStmt->bind_param("s", $emp_id);
     $userStmt->execute();
     $userRes = $userStmt->get_result()->fetch_assoc();
+    $userStmt->close();
 
     if (!$userRes) sendError("Employee not found in users table", 404);
 
     $displayPc = 'Personal PC';
-    $pcType = 'personal';
+    $pcType    = 'personal';
     if (!empty($userRes['office_pc_number'])) {
         $displayPc = 'PC-' . $userRes['office_pc_number'];
-        $pcType = 'office';
+        $pcType    = 'office';
     }
 
     $existingStmt = $conn->prepare("SELECT pc_type, pc_number FROM live_stream WHERE emp_id = ? LIMIT 1");
-    $existingStmt->bind_param("s", $emp_id);
-    $existingStmt->execute();
-    $existing = $existingStmt->get_result()->fetch_assoc();
-    
-    if ($existing && !empty($existing['pc_type'])) {
-        $pcType = $existing['pc_type'];
-        $displayPc = $existing['pc_number'];
+    if ($existingStmt) {
+        $existingStmt->bind_param("s", $emp_id);
+        $existingStmt->execute();
+        $existing = $existingStmt->get_result()->fetch_assoc();
+        $existingStmt->close();
+        if ($existing && !empty($existing['pc_type'])) {
+            $pcType    = $existing['pc_type'];
+            $displayPc = $existing['pc_number'];
+        }
     }
 
     $stmt = $conn->prepare("
-        INSERT INTO live_stream (emp_id, status, image_base64, captured_at, updated_at, pc_type, pc_number, frame_counter) 
-        VALUES (?, 'requested', NULL, NOW(), NOW(), ?, ?, 0) 
-        ON DUPLICATE KEY UPDATE 
-            status = 'requested', 
+        INSERT INTO live_stream (emp_id, status, image_base64, captured_at, updated_at, pc_type, pc_number, frame_counter)
+        VALUES (?, 'requested', NULL, NOW(), NOW(), ?, ?, 0)
+        ON DUPLICATE KEY UPDATE
+            status = 'requested',
             image_base64 = NULL,
             captured_at = NOW(),
             updated_at = NOW(),
             frame_counter = 0
     ");
+    if (!$stmt) sendError("DB prepare failed: " . $conn->error, 500);
     $stmt->bind_param("sss", $emp_id, $pcType, $displayPc);
     $stmt->execute();
+    $stmt->close();
+
+    $reqBy = normalizeEmpId($input['requested_by'] ?? '');
+    $lrStmt = $conn->prepare("
+        INSERT INTO live_requests (emp_id, status, requested_at, updated_at)
+        VALUES (?, 'pending', NOW(), NOW())
+    ");
+    if ($lrStmt) {
+        $lrStmt->bind_param("s", $emp_id);
+        @$lrStmt->execute();
+        $lrStmt->close();
+    }
 
     sendResponse([
-        "status" => "success",
-        "message" => "Live request sent successfully",
-        "emp_id" => $emp_id,
-        "emp_name" => $userRes['name'],
+        "status"    => "success",
+        "message"   => "Live request sent successfully",
+        "emp_id"    => $emp_id,
+        "emp_name"  => $userRes['name'],
         "pc_number" => $displayPc,
-        "pc_type" => $pcType
+        "pc_type"   => $pcType
     ]);
 }
 
-// ==================== 2. CHECK LIVE REQUEST (Employee) ====================
+// ==================== 2. CHECK LIVE REQUEST ====================
 if ($action === 'check_live_request' && $method === 'GET') {
     $emp_id = normalizeEmpId($_GET['emp_id'] ?? '');
     if (empty($emp_id)) sendResponse(["status" => "idle"]);
 
     $stmt = $conn->prepare("SELECT status, updated_at FROM live_stream WHERE emp_id = ? LIMIT 1");
+    if (!$stmt) sendError("DB prepare failed: " . $conn->error, 500);
     $stmt->bind_param("s", $emp_id);
     $stmt->execute();
     $res = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
 
     if ($res && $res['status'] === 'requested') {
         $requestTime = strtotime($res['updated_at']);
         if ((time() - $requestTime) > 60) {
             $upStmt = $conn->prepare("UPDATE live_stream SET status = 'idle' WHERE emp_id = ?");
-            $upStmt->bind_param("s", $emp_id);
-            $upStmt->execute();
+            if ($upStmt) {
+                $upStmt->bind_param("s", $emp_id);
+                $upStmt->execute();
+                $upStmt->close();
+            }
             sendResponse(["status" => "idle"]);
         }
     }
-
     sendResponse(["status" => $res['status'] ?? 'idle']);
 }
 
-// ==================== 3. UPLOAD SCREEN FRAME (Employee) ====================
+// ==================== 3. UPLOAD SCREEN FRAME ====================
 if ($action === 'upload_screen_frame' && $method === 'POST') {
     $emp_id       = normalizeEmpId($input['emp_id'] ?? '');
     $image_base64 = $input['image_base64'] ?? '';
@@ -283,14 +446,16 @@ if ($action === 'upload_screen_frame' && $method === 'POST') {
         sendError("Employee ID and Image Data required", 400);
     }
 
+    cleanupMonthlyHistory($conn, $emp_id, false);
+
     if (strpos($image_base64, 'base64,') !== false) {
         $image_base64 = substr($image_base64, strpos($image_base64, 'base64,') + 7);
     }
 
     $stmt = $conn->prepare("
-        INSERT INTO live_stream (emp_id, status, image_base64, captured_at, updated_at, window_title, pc_type, pc_number, frame_counter) 
-        VALUES (?, 'streaming', ?, NOW(), NOW(), ?, ?, ?, 1) 
-        ON DUPLICATE KEY UPDATE 
+        INSERT INTO live_stream (emp_id, status, image_base64, captured_at, updated_at, window_title, pc_type, pc_number, frame_counter)
+        VALUES (?, 'streaming', ?, NOW(), NOW(), ?, ?, ?, 1)
+        ON DUPLICATE KEY UPDATE
             status = 'streaming',
             image_base64 = VALUES(image_base64),
             captured_at = NOW(),
@@ -300,86 +465,100 @@ if ($action === 'upload_screen_frame' && $method === 'POST') {
             pc_number = VALUES(pc_number),
             frame_counter = frame_counter + 1
     ");
+    if (!$stmt) sendError("DB prepare failed: " . $conn->error, 500);
     $stmt->bind_param("sssss", $emp_id, $image_base64, $window_title, $pc_type, $pc_number);
 
     if (!$stmt->execute()) {
         sendError("Failed to save frame: " . $stmt->error, 500);
     }
+    $stmt->close();
 
     if ($save_history) {
         $histStmt = $conn->prepare("
-            INSERT INTO live_stream_history (emp_id, image_base64, captured_at, window_title) 
+            INSERT INTO live_stream_history (emp_id, image_base64, captured_at, window_title)
             VALUES (?, ?, NOW(), ?)
         ");
-        $histStmt->bind_param("sss", $emp_id, $image_base64, $window_title);
-        @$histStmt->execute();
+        if ($histStmt) {
+            $histStmt->bind_param("sss", $emp_id, $image_base64, $window_title);
+            @$histStmt->execute();
+            $histStmt->close();
+        }
 
         $cleanupStmt = $conn->prepare("
-            DELETE FROM live_stream_history 
-            WHERE emp_id = ? 
+            DELETE FROM live_stream_history
+            WHERE emp_id = ?
               AND id NOT IN (
                 SELECT id FROM (
-                  SELECT id FROM live_stream_history 
+                  SELECT id FROM live_stream_history
                   WHERE emp_id = ?
-                  ORDER BY captured_at DESC 
-                  LIMIT 500
+                  ORDER BY captured_at DESC
+                  LIMIT 2000
                 ) AS keep_ids
               )
         ");
-        $cleanupStmt->bind_param("ss", $emp_id, $emp_id);
-        @$cleanupStmt->execute();
+        if ($cleanupStmt) {
+            $cleanupStmt->bind_param("ss", $emp_id, $emp_id);
+            @$cleanupStmt->execute();
+            $cleanupStmt->close();
+        }
     }
 
-    @$conn->query("UPDATE users SET updated_at = NOW() WHERE UPPER(emp_id) = '$emp_id'");
+    $escaped = $conn->real_escape_string($emp_id);
+    @$conn->query("UPDATE users SET updated_at = NOW() WHERE UPPER(emp_id) = '$escaped'");
 
     $cntStmt = $conn->prepare("SELECT frame_counter FROM live_stream WHERE emp_id = ? LIMIT 1");
-    $cntStmt->bind_param("s", $emp_id);
-    $cntStmt->execute();
-    $cntRes = $cntStmt->get_result()->fetch_assoc();
+    $fc = 0;
+    if ($cntStmt) {
+        $cntStmt->bind_param("s", $emp_id);
+        $cntStmt->execute();
+        $cntRes = $cntStmt->get_result()->fetch_assoc();
+        $fc = (int)($cntRes['frame_counter'] ?? 0);
+        $cntStmt->close();
+    }
 
     sendResponse([
-        "status" => "success",
-        "size" => strlen($image_base64),
-        "frame_counter" => (int)($cntRes['frame_counter'] ?? 0),
-        "captured_at" => date('Y-m-d H:i:s')
+        "status"        => "success",
+        "size"          => strlen($image_base64),
+        "frame_counter" => $fc,
+        "captured_at"   => date('Y-m-d H:i:s')
     ]);
 }
 
-// ==================== 4. GET LATEST LIVE STREAM (Manager) ====================
+// ==================== 4. GET LATEST LIVE STREAM ====================
 if ($action === 'get_live_stream' && $method === 'GET') {
     $emp_id = normalizeEmpId($_GET['emp_id'] ?? '');
     if (empty($emp_id)) sendError("Employee ID required", 400);
 
     $stmt = $conn->prepare("
-        SELECT id, image_base64, captured_at, updated_at, status, window_title, 
-               pc_type, pc_number, frame_counter 
-        FROM live_stream 
-        WHERE emp_id = ? 
+        SELECT id, image_base64, captured_at, updated_at, status, window_title,
+               pc_type, pc_number, frame_counter
+        FROM live_stream
+        WHERE emp_id = ?
         LIMIT 1
     ");
+    if (!$stmt) sendError("DB prepare failed: " . $conn->error, 500);
     $stmt->bind_param("s", $emp_id);
     $stmt->execute();
     $result = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
 
     if ($result && !empty($result['image_base64']) && $result['status'] === 'streaming') {
         $age = time() - strtotime($result['captured_at']);
-
         if ($age > 180) {
             sendResponse(["status" => "stale", "message" => "Stream is stale", "age" => $age]);
         }
-
         sendResponse([
-            "status" => "success",
-            "id" => $result['id'],
-            "image_base64" => $result['image_base64'],
-            "captured_at" => $result['captured_at'],
-            "updated_at" => $result['updated_at'],
+            "status"        => "success",
+            "id"            => (int)$result['id'],
+            "image_base64"  => $result['image_base64'],
+            "captured_at"   => $result['captured_at'],
+            "updated_at"    => $result['updated_at'],
             "stream_status" => $result['status'],
-            "window_title" => $result['window_title'],
-            "pc_type" => $result['pc_type'],
-            "pc_number" => $result['pc_number'],
+            "window_title"  => $result['window_title'],
+            "pc_type"       => $result['pc_type'],
+            "pc_number"     => $result['pc_number'],
             "frame_counter" => (int)($result['frame_counter'] ?? 0),
-            "age" => $age
+            "age"           => $age
         ]);
     } else if ($result && $result['status'] === 'requested') {
         sendResponse(["status" => "waiting", "message" => "Waiting for employee to accept..."]);
@@ -388,150 +567,186 @@ if ($action === 'get_live_stream' && $method === 'GET') {
     }
 }
 
-// ==================== 5. GET FRAME HISTORY (Manager) ====================
+// ==================== 5. GET FRAME HISTORY ====================
 if ($action === 'get_frame_history' && $method === 'GET') {
     $emp_id = normalizeEmpId($_GET['emp_id'] ?? '');
     $limit  = intval($_GET['limit'] ?? 100);
     if ($limit < 1 || $limit > 500) $limit = 100;
     if (empty($emp_id)) sendError("Employee ID required", 400);
 
+    cleanupMonthlyHistory($conn, $emp_id, false);
+
     $stmt = $conn->prepare("
         SELECT id, image_base64, captured_at, window_title
-        FROM live_stream_history 
+        FROM live_stream_history
         WHERE emp_id = ? AND image_base64 IS NOT NULL
-        ORDER BY captured_at DESC 
+        ORDER BY captured_at DESC
         LIMIT ?
     ");
+    if (!$stmt) sendError("DB prepare failed: " . $conn->error, 500);
     $stmt->bind_param("si", $emp_id, $limit);
     $stmt->execute();
     $res = $stmt->get_result();
 
     $frames = [];
+    $idx = 0;
     while ($row = $res->fetch_assoc()) {
+        $idx++;
         $frames[] = [
-            "id" => (int)$row['id'],
+            "id"           => $idx,
+            "db_id"        => (int)$row['id'],
             "image_base64" => $row['image_base64'],
-            "captured_at" => $row['captured_at'],
+            "captured_at"  => $row['captured_at'],
             "window_title" => $row['window_title']
         ];
     }
+    $stmt->close();
 
-    $devStmt = $conn->prepare("
-        SELECT u.device_id, u.computer_name, d.pc_number AS office_pc_number, d.device_name,
-               ls.pc_type, ls.pc_number
+    $userStmt = $conn->prepare("
+        SELECT u.id, u.emp_id, u.role, u.device_id, u.computer_name,
+               d.pc_number AS office_pc_number, d.device_name AS office_device_name
         FROM users u
         LEFT JOIN devices d ON d.device_id = u.device_id
-        LEFT JOIN live_stream ls ON ls.emp_id = u.emp_id
         WHERE UPPER(u.emp_id) = ?
         LIMIT 1
     ");
-    $devStmt->bind_param("s", $emp_id);
-    $devStmt->execute();
-    $device = $devStmt->get_result()->fetch_assoc();
+    $userRow = null;
+    if ($userStmt) {
+        $userStmt->bind_param("s", $emp_id);
+        $userStmt->execute();
+        $userRow = $userStmt->get_result()->fetch_assoc();
+        $userStmt->close();
+    }
 
-    $pcDisplay = $device['pc_number'] ?? 'Personal PC';
-    $pcType = $device['pc_type'] ?? 'personal';
+    $deviceId   = 'N/A';
+    $deviceName = 'N/A';
+    $pcDisplay  = 'Personal PC';
+    $pcType     = 'personal';
 
-    if ($pcDisplay === 'Personal PC' && !empty($device['office_pc_number'])) {
-        $pcDisplay = 'PC-' . $device['office_pc_number'];
-        $pcType = 'office';
+    if ($userRow) {
+        $deviceId   = $userRow['device_id'] ?? 'N/A';
+        $deviceName = $userRow['computer_name'] ?? $userRow['office_device_name'] ?? 'N/A';
+        list($pcType, $pcDisplay) = resolvePcInfo($userRow['role'], [
+            'pc_number' => $userRow['office_pc_number'] ?? null
+        ]);
     }
 
     sendResponse([
         "status" => "success",
-        "count" => count($frames),
+        "count"  => count($frames),
         "frames" => $frames,
         "device" => [
-            "pc_number" => $pcDisplay,
-            "pc_type" => $pcType,
-            "device_id" => $device['device_id'] ?? 'N/A',
-            "computer_name" => $device['computer_name'] ?? $device['device_name'] ?? 'N/A'
+            "pc_number"     => $pcDisplay,
+            "pc_type"       => $pcType,
+            "device_id"     => $deviceId,
+            "computer_name" => $deviceName
         ]
     ]);
 }
 
-// ==================== 6. GET VIDEO PLAYBACK (Manager) ====================
+// ==================== 6. GET VIDEO PLAYBACK ====================
 if ($action === 'get_video_playback' && $method === 'GET') {
     $emp_id = normalizeEmpId($_GET['emp_id'] ?? '');
     $limit  = intval($_GET['limit'] ?? 500);
     if ($limit < 1 || $limit > 1000) $limit = 500;
     if (empty($emp_id)) sendError("Employee ID required", 400);
 
+    cleanupMonthlyHistory($conn, $emp_id, false);
+
     $stmt = $conn->prepare("
         SELECT id, image_base64, captured_at, window_title
-        FROM live_stream_history 
+        FROM live_stream_history
         WHERE emp_id = ? AND image_base64 IS NOT NULL
-        ORDER BY captured_at ASC 
+        ORDER BY captured_at ASC
         LIMIT ?
     ");
+    if (!$stmt) sendError("DB prepare failed: " . $conn->error, 500);
     $stmt->bind_param("si", $emp_id, $limit);
     $stmt->execute();
     $res = $stmt->get_result();
 
     $frames = [];
+    $idx = 0;
     while ($row = $res->fetch_assoc()) {
+        $idx++;
         $frames[] = [
-            "id" => (int)$row['id'],
+            "id"           => $idx,
+            "db_id"        => (int)$row['id'],
             "image_base64" => $row['image_base64'],
-            "captured_at" => $row['captured_at'],
+            "captured_at"  => $row['captured_at'],
             "window_title" => $row['window_title']
         ];
     }
+    $stmt->close();
 
-    $devStmt = $conn->prepare("
-        SELECT u.device_id, u.computer_name, d.pc_number AS office_pc_number, d.device_name,
-               ls.pc_type, ls.pc_number
+    $userStmt = $conn->prepare("
+        SELECT u.id, u.emp_id, u.role, u.device_id, u.computer_name,
+               d.pc_number AS office_pc_number, d.device_name AS office_device_name
         FROM users u
         LEFT JOIN devices d ON d.device_id = u.device_id
-        LEFT JOIN live_stream ls ON ls.emp_id = u.emp_id
         WHERE UPPER(u.emp_id) = ?
         LIMIT 1
     ");
-    $devStmt->bind_param("s", $emp_id);
-    $devStmt->execute();
-    $device = $devStmt->get_result()->fetch_assoc();
-
-    $pcDisplay = $device['pc_number'] ?? 'Personal PC';
-    $pcType = $device['pc_type'] ?? 'personal';
-
-    if ($pcDisplay === 'Personal PC' && !empty($device['office_pc_number'])) {
-        $pcDisplay = 'PC-' . $device['office_pc_number'];
-        $pcType = 'office';
+    $userRow = null;
+    if ($userStmt) {
+        $userStmt->bind_param("s", $emp_id);
+        $userStmt->execute();
+        $userRow = $userStmt->get_result()->fetch_assoc();
+        $userStmt->close();
     }
 
-    // Append current live frame if streaming
+    $deviceId   = 'N/A';
+    $deviceName = 'N/A';
+    $pcDisplay  = 'Personal PC';
+    $pcType     = 'personal';
+
+    if ($userRow) {
+        $deviceId   = $userRow['device_id'] ?? 'N/A';
+        $deviceName = $userRow['computer_name'] ?? $userRow['office_device_name'] ?? 'N/A';
+        list($pcType, $pcDisplay) = resolvePcInfo($userRow['role'], [
+            'pc_number' => $userRow['office_pc_number'] ?? null
+        ]);
+    }
+
+    // Append live frame if streaming
     $liveStmt = $conn->prepare("
-        SELECT image_base64, captured_at, window_title, status 
-        FROM live_stream 
+        SELECT image_base64, captured_at, window_title, status
+        FROM live_stream
         WHERE emp_id = ? AND status = 'streaming' AND image_base64 IS NOT NULL
         LIMIT 1
     ");
-    $liveStmt->bind_param("s", $emp_id);
-    $liveStmt->execute();
-    $liveFrame = $liveStmt->get_result()->fetch_assoc();
+    $liveFrame = null;
+    if ($liveStmt) {
+        $liveStmt->bind_param("s", $emp_id);
+        $liveStmt->execute();
+        $liveFrame = $liveStmt->get_result()->fetch_assoc();
+        $liveStmt->close();
+    }
 
     if ($liveFrame && !empty($liveFrame['image_base64'])) {
         $lastHistoryTime = !empty($frames) ? end($frames)['captured_at'] : null;
         if ($lastHistoryTime !== $liveFrame['captured_at']) {
+            $idx++;
             $frames[] = [
-                "id" => -1,
+                "id"           => $idx,
+                "db_id"        => -1,
                 "image_base64" => $liveFrame['image_base64'],
-                "captured_at" => $liveFrame['captured_at'],
+                "captured_at"  => $liveFrame['captured_at'],
                 "window_title" => $liveFrame['window_title'],
-                "is_live" => true
+                "is_live"      => true
             ];
         }
     }
 
     sendResponse([
         "status" => "success",
-        "count" => count($frames),
+        "count"  => count($frames),
         "frames" => $frames,
         "device" => [
-            "pc_number" => $pcDisplay,
-            "pc_type" => $pcType,
-            "device_id" => $device['device_id'] ?? 'N/A',
-            "computer_name" => $device['computer_name'] ?? $device['device_name'] ?? 'N/A'
+            "pc_number"     => $pcDisplay,
+            "pc_type"       => $pcType,
+            "device_id"     => $deviceId,
+            "computer_name" => $deviceName
         ]
     ]);
 }
@@ -544,15 +759,31 @@ if ($action === 'stop_live_stream' && $method === 'POST') {
     if (!empty($emp_id)) {
         if ($keep_history) {
             $stmt = $conn->prepare("UPDATE live_stream SET status = 'idle', image_base64 = NULL, updated_at = NOW() WHERE emp_id = ?");
-            $stmt->bind_param("s", $emp_id);
-            $stmt->execute();
+            if ($stmt) {
+                $stmt->bind_param("s", $emp_id);
+                $stmt->execute();
+                $stmt->close();
+            }
         } else {
             $stmt = $conn->prepare("DELETE FROM live_stream WHERE emp_id = ?");
-            $stmt->bind_param("s", $emp_id);
-            $stmt->execute();
+            if ($stmt) {
+                $stmt->bind_param("s", $emp_id);
+                $stmt->execute();
+                $stmt->close();
+            }
             $stmt2 = $conn->prepare("DELETE FROM live_stream_history WHERE emp_id = ?");
-            $stmt2->bind_param("s", $emp_id);
-            $stmt2->execute();
+            if ($stmt2) {
+                $stmt2->bind_param("s", $emp_id);
+                $stmt2->execute();
+                $stmt2->close();
+            }
+        }
+
+        $lr = $conn->prepare("UPDATE live_requests SET status = 'closed', updated_at = NOW() WHERE emp_id = ? AND status = 'pending'");
+        if ($lr) {
+            $lr->bind_param("s", $emp_id);
+            @$lr->execute();
+            $lr->close();
         }
     }
 
@@ -564,80 +795,135 @@ if ($action === 'clear_history' && $method === 'POST') {
     $emp_id = normalizeEmpId($input['emp_id'] ?? '');
     if (!empty($emp_id)) {
         $stmt = $conn->prepare("DELETE FROM live_stream_history WHERE emp_id = ?");
-        $stmt->bind_param("s", $emp_id);
-        $stmt->execute();
+        if ($stmt) {
+            $stmt->bind_param("s", $emp_id);
+            $stmt->execute();
+            $stmt->close();
+        }
     }
     sendResponse(["status" => "success", "message" => "History cleared"]);
 }
 
-// ==================== 9. VERIFY EMPLOYEE (with heartbeat) ====================
-if ($action === 'verify_employee' && $method === 'GET') {
-    $emp_id = normalizeEmpId($_GET['emp_id'] ?? '');
+// ==================== 9. VERIFY EMPLOYEE (GET + POST with password) ====================
+/**
+ * GET  / live_stream.php?action=verify_employee&emp_id=GS-E-01
+ * POST / live_stream.php?action=verify_employee
+ *   {
+ *     "emp_id":   "GS-E-01",
+ *     "emp_name": "Shubham Shah",
+ *     "email":    "shahshubham128@gmail.com",
+ *     "role":     "Website Developer",
+ *     "mobile":   "8488076449",
+ *     "password": "GS-shubhams:@01"    <-- optional, verified with password_verify()
+ *   }
+ */
+if ($action === 'verify_employee' && ($method === 'GET' || $method === 'POST')) {
+
+    $emp_id   = normalizeEmpId(
+        $input['emp_id'] ?? $_GET['emp_id'] ?? ''
+    );
+    $emp_name = trim((string)($input['emp_name'] ?? $_GET['emp_name'] ?? ''));
+    $email    = trim((string)($input['email']    ?? $_GET['email']    ?? ''));
+    $role     = trim((string)($input['role']     ?? $_GET['role']     ?? ''));
+    $mobile   = trim((string)($input['mobile']   ?? $_GET['mobile']   ?? ''));
+    $pwdPlain = (string)($input['password']      ?? $_GET['password'] ?? '');
+
     if (empty($emp_id)) sendError("Employee ID required", 400);
 
     $stmt = $conn->prepare("
-        SELECT u.id, u.emp_id, u.name, u.email, u.mobile, u.role, 
+        SELECT u.id, u.emp_id, u.name, u.email, u.mobile, u.role, u.password,
                u.device_id, u.computer_name, u.is_active, u.updated_at,
                u.last_heartbeat, u.app_running,
-               d.pc_number AS office_pc_number, 
+               d.pc_number AS office_pc_number,
                d.device_name AS office_device_name,
                ls.pc_type, ls.pc_number
         FROM users u
         LEFT JOIN devices d ON d.device_id = u.device_id
         LEFT JOIN live_stream ls ON ls.emp_id = u.emp_id
-        WHERE UPPER(u.emp_id) = ? 
+        WHERE UPPER(u.emp_id) = ?
         LIMIT 1
     ");
+    if (!$stmt) sendError("DB prepare failed: " . $conn->error, 500);
     $stmt->bind_param("s", $emp_id);
     $stmt->execute();
     $user = $stmt->get_result()->fetch_assoc();
+    $stmt->close();
 
     if (!$user) {
         sendResponse([
-            "status" => "not_found",
-            "message" => "Employee not found",
+            "status"    => "not_found",
+            "message"   => "Employee not found",
             "is_online" => false,
             "is_active" => false
         ]);
     }
 
-    // Active if heartbeat within last 30 seconds
+    // ====================== PASSWORD VERIFICATION ======================
+    // If a plaintext password is provided, verify against the stored hash.
+    // Supports bcrypt, argon2, etc. (anything password_verify() accepts).
+    $passwordChecked = false;
+    $passwordValid   = false;
+
+    if ($pwdPlain !== '') {
+        $passwordChecked = true;
+        $storedHash = $user['password'] ?? '';
+        if (!empty($storedHash) && password_verify($pwdPlain, $storedHash)) {
+            $passwordValid = true;
+        }
+    }
+    // ==================================================================
+
+    // Cross-check optional identity fields
+    $identityMismatch = false;
+    if ($emp_name !== '' && strcasecmp(trim($user['name']), $emp_name) !== 0) $identityMismatch = true;
+    if ($email    !== '' && strcasecmp(trim((string)$user['email']), $email) !== 0) $identityMismatch = true;
+    if ($role     !== '' && strcasecmp(trim((string)$user['role']), $role)   !== 0) $identityMismatch = true;
+    if ($mobile   !== '' && trim((string)$user['mobile']) !== $mobile)             $identityMismatch = true;
+
     $lastHeartbeat = strtotime($user['last_heartbeat'] ?? '2000-01-01');
-    $isAppActive = (time() - $lastHeartbeat) < 30 && ($user['app_running'] == 1);
-    $isUserActive = ($user['is_active'] == 1);
+    $isAppActive   = (time() - $lastHeartbeat) < 30 && ((int)$user['app_running'] === 1);
+    $isUserActive  = ((int)$user['is_active'] === 1);
 
+    // Determine PC display
     $pcDisplay = 'Personal PC';
-    $pcType = 'personal';
-
+    $pcType    = 'personal';
     if (!empty($user['pc_type']) && !empty($user['pc_number'])) {
-        $pcType = $user['pc_type'];
+        $pcType    = $user['pc_type'];
         $pcDisplay = $user['pc_number'];
     } elseif (!empty($user['office_pc_number'])) {
         $pcDisplay = 'PC-' . $user['office_pc_number'];
-        $pcType = 'office';
+        $pcType    = 'office';
     }
 
+    $finalDeviceId   = !empty($user['device_id'])     ? $user['device_id']     : 'N/A';
+    $finalDeviceName = !empty($user['computer_name']) ? $user['computer_name']
+                     : (!empty($user['office_device_name']) ? $user['office_device_name'] : 'N/A');
+
     sendResponse([
-        "status" => "success",
-        "is_online" => $isAppActive,
-        "is_active" => $isAppActive,
-        "is_enabled" => $isUserActive,
-        "last_heartbeat" => $user['last_heartbeat'],
+        "status"            => "success",
+        "verified"          => true,
+        "password_checked"  => $passwordChecked,
+        "password_valid"    => $passwordChecked ? $passwordValid : null,
+        "identity_mismatch" => $identityMismatch,
+        "is_online"         => $isAppActive,
+        "is_active"         => $isAppActive,
+        "is_enabled"        => $isUserActive,
+        "last_heartbeat"    => $user['last_heartbeat'],
         "employee" => [
-            "id" => (int)$user['id'],
-            "emp_id" => $user['emp_id'],
-            "name" => $user['name'],
-            "email" => $user['email'],
-            "mobile" => $user['mobile'],
-            "role" => $user['role'],
-            "pc_number" => $pcDisplay,
-            "pc_type" => $pcType,
-            "device_id" => $user['device_id'] ?? 'N/A',
-            "computer_name" => $user['computer_name'] ?? $user['office_device_name'] ?? 'N/A',
-            "is_active" => (int)$user['is_active'],
-            "is_enabled" => $isUserActive,
-            "is_app_active" => $isAppActive,
-            "last_seen" => $user['updated_at'],
+            "id"             => (int)$user['id'],
+            "emp_id"         => $user['emp_id'],
+            "name"           => $user['name'],
+            "email"          => $user['email'],
+            "mobile"         => $user['mobile'],
+            "role"           => $user['role'],
+            "pc_number"      => $pcDisplay,
+            "pc_type"        => $pcType,
+            "device_id"      => $finalDeviceId,
+            "computer_name"  => $finalDeviceName,
+            "is_active"      => (int)$user['is_active'],
+            "is_enabled"     => $isUserActive,
+            "is_app_active"  => $isAppActive,
+            "last_seen"      => $user['updated_at'],
             "last_heartbeat" => $user['last_heartbeat']
         ]
     ]);
@@ -646,7 +932,8 @@ if ($action === 'verify_employee' && $method === 'GET') {
 // ==================== 10. GET ALL ACTIVE STREAMS ====================
 if ($action === 'get_active_streams' && $method === 'GET') {
     $stmt = $conn->prepare("
-        SELECT ls.emp_id, ls.status, ls.captured_at, ls.updated_at, ls.pc_type, ls.pc_number,
+        SELECT ls.emp_id, ls.status, ls.captured_at, ls.updated_at,
+               ls.pc_type, ls.pc_number,
                u.name, u.device_id,
                d.pc_number AS office_pc_number
         FROM live_stream ls
@@ -655,6 +942,7 @@ if ($action === 'get_active_streams' && $method === 'GET') {
         WHERE ls.status IN ('streaming', 'requested')
         ORDER BY ls.updated_at DESC
     ");
+    if (!$stmt) sendError("DB prepare failed: " . $conn->error, 500);
     $stmt->execute();
     $res = $stmt->get_result();
 
@@ -665,19 +953,97 @@ if ($action === 'get_active_streams' && $method === 'GET') {
             $pcDisplay = 'PC-' . $row['office_pc_number'];
         }
         $streams[] = [
-            "emp_id" => $row['emp_id'],
-            "status" => $row['status'],
+            "emp_id"      => $row['emp_id'],
+            "status"      => $row['status'],
             "captured_at" => $row['captured_at'],
-            "updated_at" => $row['updated_at'],
-            "name" => $row['name'] ?? 'Unknown',
-            "pc_number" => $pcDisplay,
-            "pc_type" => $row['pc_type'] ?? 'personal'
+            "updated_at"  => $row['updated_at'],
+            "name"        => $row['name'] ?? 'Unknown',
+            "pc_number"   => $pcDisplay,
+            "pc_type"     => $row['pc_type'] ?? 'personal'
         ];
     }
+    $stmt->close();
 
     sendResponse(["status" => "success", "streams" => $streams]);
 }
 
+// ==================== 11. LIST LIVE REQUESTS ====================
+if ($action === 'list_live_requests' && $method === 'GET') {
+    $emp_id = normalizeEmpId($_GET['emp_id'] ?? '');
+    $limit  = intval($_GET['limit'] ?? 100);
+    if ($limit < 1 || $limit > 500) $limit = 100;
+
+    if (!empty($emp_id)) {
+        $stmt = $conn->prepare("
+            SELECT id, emp_id, status, requested_at, updated_at
+            FROM live_requests
+            WHERE emp_id = ?
+            ORDER BY requested_at DESC
+            LIMIT ?
+        ");
+        if (!$stmt) sendError("DB prepare failed: " . $conn->error, 500);
+        $stmt->bind_param("si", $emp_id, $limit);
+    } else {
+        $stmt = $conn->prepare("
+            SELECT id, emp_id, status, requested_at, updated_at
+            FROM live_requests
+            ORDER BY requested_at DESC
+            LIMIT ?
+        ");
+        if (!$stmt) sendError("DB prepare failed: " . $conn->error, 500);
+        $stmt->bind_param("i", $limit);
+    }
+    $stmt->execute();
+    $res = $stmt->get_result();
+
+    $rows = [];
+    while ($row = $res->fetch_assoc()) {
+        $rows[] = [
+            "id"           => (int)$row['id'],
+            "emp_id"       => $row['emp_id'],
+            "status"       => $row['status'],
+            "requested_at" => $row['requested_at'],
+            "updated_at"   => $row['updated_at']
+        ];
+    }
+    $stmt->close();
+
+    sendResponse(["status" => "success", "count" => count($rows), "requests" => $rows]);
+}
+
+// ==================== 12. UPDATE LIVE REQUEST STATUS ====================
+if ($action === 'update_live_request' && $method === 'POST') {
+    $id     = intval($input['id'] ?? 0);
+    $status = trim((string)($input['status'] ?? ''));
+
+    if ($id <= 0 || $status === '') sendError("id and status required", 400);
+
+    $allowed = ['pending', 'accepted', 'rejected', 'closed'];
+    if (!in_array($status, $allowed, true)) {
+        sendError("Invalid status. Allowed: " . implode(', ', $allowed), 400);
+    }
+
+    $stmt = $conn->prepare("UPDATE live_requests SET status = ?, updated_at = NOW() WHERE id = ?");
+    if (!$stmt) sendError("DB prepare failed: " . $conn->error, 500);
+    $stmt->bind_param("si", $status, $id);
+    $stmt->execute();
+    $affected = $stmt->affected_rows;
+    $stmt->close();
+
+    sendResponse([
+        "status"   => "success",
+        "message"  => "Live request updated",
+        "affected" => $affected
+    ]);
+}
+
+// ==================== FALLBACK ====================
 $conn->close();
-sendError("Invalid endpoint request", 400);
-?>
+sendError(
+    "Invalid endpoint request. Received action='" . $action . "', method='" . $method . "'. " .
+    "Available actions: heartbeat, app_shutdown, verify_pc_type, send_live_request, " .
+    "check_live_request, upload_screen_frame, get_live_stream, get_frame_history, " .
+    "get_video_playback, stop_live_stream, clear_history, verify_employee, " .
+    "get_active_streams, list_live_requests, update_live_request",
+    400
+);
