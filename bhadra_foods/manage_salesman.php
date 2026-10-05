@@ -4,6 +4,12 @@ header("Access-Control-Allow-Headers: Content-Type, Authorization");
 header("Access-Control-Allow-Methods: POST, GET, PUT, DELETE, OPTIONS");
 header("Content-Type: application/json; charset=UTF-8");
 
+// Handle preflight OPTIONS requests
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit();
+}
+
 require_once "data.php";
 
 $database = new Database();
@@ -37,6 +43,68 @@ function generateEmpId($db, $role) {
         $lastTwoDigits = substr($timestamp, -2);
         return $prefix . '-' . $lastTwoDigits;
     }
+}
+
+// ============================================================
+// GET — Verify firm (firm_name + mobile + pin_code + address)
+// ============================================================
+if ($method === 'GET' && isset($_GET['action']) && $_GET['action'] === 'verify_firm') {
+    $firm_name = $_GET['firm_name'] ?? '';
+    $mobile    = $_GET['mobile']    ?? '';
+    $pin_code  = $_GET['pin_code']  ?? '';
+    $address   = $_GET['address']   ?? '';
+
+    if (empty($firm_name) || empty($mobile) || empty($pin_code)) {
+        echo json_encode([
+            "status"  => false, 
+            "exists"  => false,
+            "message" => "firm_name, mobile and pin_code are required"
+        ]);
+        exit();
+    }
+
+    try {
+        // Validate against ALL four fields when address is provided
+        if (!empty($address)) {
+            $sql = "SELECT id, name, emp_id, role, firm_name, mobile, pin_code, address 
+                    FROM users 
+                    WHERE firm_name = :firm_name AND mobile = :mobile AND pin_code = :pin_code AND address = :address
+                    LIMIT 1";
+            $stmt = $db->prepare($sql);
+            $stmt->bindParam(":firm_name", $firm_name);
+            $stmt->bindParam(":mobile", $mobile);
+            $stmt->bindParam(":pin_code", $pin_code);
+            $stmt->bindParam(":address", $address);
+        } else {
+            $sql = "SELECT id, name, emp_id, role, firm_name, mobile, pin_code, address 
+                    FROM users 
+                    WHERE firm_name = :firm_name AND mobile = :mobile AND pin_code = :pin_code
+                    LIMIT 1";
+            $stmt = $db->prepare($sql);
+            $stmt->bindParam(":firm_name", $firm_name);
+            $stmt->bindParam(":mobile", $mobile);
+            $stmt->bindParam(":pin_code", $pin_code);
+        }
+
+        $stmt->execute();
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+        if ($row) {
+            echo json_encode([
+                "status" => true,
+                "exists" => true,
+                "firm"   => $row
+            ]);
+        } else {
+            echo json_encode(["status" => true, "exists" => false]);
+        }
+    } catch (Exception $e) {
+        echo json_encode([
+            "status"  => false, 
+            "message" => "Error verifying firm: " . $e->getMessage()
+        ]);
+    }
+    exit();
 }
 
 switch($method) {

@@ -21,30 +21,31 @@ if (empty($username) || empty($password) || empty($role)) {
     exit();
 }
 
-// Ensure you query the column storing the Employee ID (e.g., emp_id or id)
-$stmt = $conn->prepare("SELECT id AS emp_id, name, email, password FROM users WHERE (email = ? OR name = ?) LIMIT 1");
-$stmt->bind_param("ss", $username, $username);
+// Check email, mobile, or emp_id along with the selected role
+$stmt = $conn->prepare("SELECT emp_id, name, email, mobile, password, role FROM users WHERE (email = ? OR mobile = ? OR emp_id = ?) AND role = ? LIMIT 1");
+$stmt->bind_param("ssss", $username, $username, $username, $role);
 $stmt->execute();
 $result = $stmt->get_result();
 
 if ($user = $result->fetch_assoc()) {
-    // Note: Use password_verify($password, $user['password']) in production
+    // Check plaintext or hashed password
     if ($password === $user['password'] || password_verify($password, $user['password'])) {
         echo json_encode([
             "status" => "success",
             "message" => "Login successful",
             "user" => [
                 "emp_id" => (string)$user['emp_id'],
-                "name" => $user['name'],
-                "email" => $user['email'],
-                "role" => $role
+                "name"   => $user['name'],
+                "email"  => $user['email'],
+                "mobile" => $user['mobile'] ?? '',
+                "role"   => $user['role']
             ]
         ]);
     } else {
         echo json_encode(["status" => "error", "message" => "Invalid credentials"]);
     }
 } else {
-    echo json_encode(["status" => "error", "message" => "User not found"]);
+    echo json_encode(["status" => "error", "message" => "User not found or role mismatch"]);
 }
 
 $conn->close();
