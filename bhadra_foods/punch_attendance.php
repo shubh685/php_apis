@@ -14,13 +14,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit();
 }
 
-mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+require_once __DIR__ . '/data.php';
 
 try {
-    $conn = new mysqli("localhost", "root", "", "bhadra_foods");
-    $conn->set_charset("utf8mb4");
+    $db = new Database();
+    $conn = $db->getConnection();
+
+    if (!$conn) {
+        throw new Exception("Database connection failed.");
+    }
 
     // ── Read inputs ──
+    // NOTE: latitude, longitude, and address are NOT stored in the
+    // attendance table, so we intentionally do NOT read them here.
     $emp_id_str  = trim($_POST['emp_id']     ?? '');
     $role        = trim($_POST['role']       ?? '');
     $punch_type  = strtoupper(trim($_POST['punch_type'] ?? 'PUNCH_IN'));
@@ -31,30 +37,26 @@ try {
 
     // ── Validate ──
     if ($emp_id_str === '' || $role === '') {
-        echo json_encode(["status" => "error", "message" => "emp_id and role are required"]);
+        echo json_encode(["status" => false, "message" => "emp_id and role are required"]);
         exit();
     }
 
     if (!in_array($punch_type, ['PUNCH_IN', 'PUNCH_OUT'], true)) {
-        echo json_encode(["status" => "error", "message" => "Invalid punch_type"]);
+        echo json_encode(["status" => false, "message" => "Invalid punch_type"]);
         exit();
     }
 
     // ── 1. Resolve internal user ID from emp_id ──
-    $userStmt = $conn->prepare("SELECT id FROM users WHERE emp_id = ? LIMIT 1");
-    $userStmt->bind_param("s", $emp_id_str);
-    $userStmt->execute();
-    $userResult = $userStmt->get_result();
+    $userStmt = $conn->prepare("SELECT id FROM users WHERE emp_id = :emp_id LIMIT 1");
+    $userStmt->execute([':emp_id' => $emp_id_str]);
+    $userData = $userStmt->fetch();
 
-    if ($userResult->num_rows === 0) {
-        echo json_encode(["status" => "error", "message" => "Invalid Employee ID provided"]);
-        $conn->close();
+    if (!$userData) {
+        echo json_encode(["status" => false, "message" => "Invalid Employee ID provided"]);
         exit();
     }
 
-    $userData        = $userResult->fetch_assoc();
     $resolved_emp_id = $userData['id'];
-    $userStmt->close();
 
     // ── 2. Time rules ──
     $timeParts            = explode(':', $device_time);
@@ -66,32 +68,29 @@ try {
     $dayOfWeek            = (int)date('N', strtotime($device_date)); // 1=Mon … 7=Sun
 
     if ($dayOfWeek === 7) {
-        echo json_encode(["status" => "error", "message" => "Punch not allowed on Sunday"]);
-        $conn->close();
+        echo json_encode(["status" => false, "message" => "Punch not allowed on Sunday"]);
         exit();
     }
 
-    // Check if a row already exists for today (single-row-per-day model)
+    // Check if a row already exists for today
     $existingRowStmt = $conn->prepare(
-        "SELECT id, photo, punch_type FROM attendance WHERE emp_id = ? AND punch_date = ? LIMIT 1"
+        "SELECT id, photo, punch_type FROM attendance WHERE emp_id = :emp_id AND punch_date = :punch_date LIMIT 1"
     );
-    $existingRowStmt->bind_param("ss", $resolved_emp_id, $device_date);
-    $existingRowStmt->execute();
-    $existingResult = $existingRowStmt->get_result();
-    $existingRow    = $existingResult->num_rows > 0 ? $existingResult->fetch_assoc() : null;
-    $existingRowStmt->close();
+    $existingRowStmt->execute([
+        ':emp_id'     => $resolved_emp_id,
+        ':punch_date' => $device_date
+    ]);
+    $existingRow = $existingRowStmt->fetch();
 
     // ── PUNCH_IN rules ──
     if ($punch_type === 'PUNCH_IN') {
         if ($currentTimeInMinutes >= $endTime) {
-            echo json_encode(["status" => "error", "message" => "Punch In closed for today (after 6:00 PM)"]);
-            $conn->close();
+            echo json_encode(["status" => false, "message" => "Punch In closed for today (after 6:00 PM)"]);
             exit();
         }
 
         if ($existingRow && $existingRow['punch_type'] === 'PUNCH_IN') {
-            echo json_encode(["status" => "error", "message" => "You are already punched in. Punch Out first."]);
-            $conn->close();
+            echo json_encode(["status" => false, "message" => "You are already punched in. Punch Out first."]);
             exit();
         }
     }
@@ -99,24 +98,20 @@ try {
     // ── PUNCH_OUT rules ──
     if ($punch_type === 'PUNCH_OUT') {
         if (!$existingRow) {
-            echo json_encode(["status" => "error", "message" => "No Punch In found for today. Please Punch In first."]);
-            $conn->close();
+            echo json_encode(["status" => false, "message" => "No Punch In found for today. Please Punch In first."]);
             exit();
         }
 
         if ($existingRow['punch_type'] === 'PUNCH_OUT') {
-            echo json_encode(["status" => "error", "message" => "You have already punched out today!"]);
-            $conn->close();
+            echo json_encode(["status" => false, "message" => "You have already punched out today!"]);
             exit();
         }
 
-        // Manual punch-out must be within 9 AM – 6 PM. Auto punch-out bypasses.
         if (!$isAuto && ($currentTimeInMinutes < $startTime || $currentTimeInMinutes > $endTime)) {
             echo json_encode([
-                "status"  => "error",
+                "status"  => false,
                 "message" => "Punch Out allowed only between 9:00 AM and 6:00 PM"
             ]);
-            $conn->close();
             exit();
         }
     }
@@ -133,8 +128,7 @@ try {
 
         $maxSize = 5 * 1024 * 1024;
         if ($_FILES['photo']['size'] > $maxSize) {
-            echo json_encode(["status" => "error", "message" => "Photo size exceeds 5MB limit"]);
-            $conn->close();
+            echo json_encode(["status" => false, "message" => "Photo size exceeds 5MB limit"]);
             exit();
         }
 
@@ -144,8 +138,7 @@ try {
         finfo_close($finfo);
 
         if (!in_array($mimeType, $allowedTypes, true)) {
-            echo json_encode(["status" => "error", "message" => "Invalid photo format. Only JPEG, PNG, WebP allowed"]);
-            $conn->close();
+            echo json_encode(["status" => false, "message" => "Invalid photo format. Only JPEG, PNG, WebP allowed"]);
             exit();
         }
 
@@ -161,15 +154,15 @@ try {
         if (move_uploaded_file($_FILES['photo']['tmp_name'], $targetPath)) {
             $imagePath = "uploads/attendance/" . $fileName;
         } else {
-            echo json_encode(["status" => "error", "message" => "Failed to upload photo"]);
-            $conn->close();
+            echo json_encode(["status" => false, "message" => "Failed to upload photo"]);
             exit();
         }
     }
 
-    // ── 4. Insert or Update the single daily row ──
+    // ── 4. Insert or Update ──
+    // NOTE: The attendance table does NOT contain latitude/longitude/address,
+    //       so those fields are intentionally omitted from INSERT/UPDATE.
     if ($existingRow) {
-        // Append new photo to comma-separated list
         $currentPhotos = ($existingRow['photo'] ?? '') !== ''
             ? explode(',', $existingRow['photo'])
             : [];
@@ -182,50 +175,42 @@ try {
 
         $updateStmt = $conn->prepare(
             "UPDATE attendance
-             SET role       = ?,
-                 photo      = ?,
-                 punch_type = ?,
-                 punch_time = ?,
+             SET role       = :role,
+                 photo      = :photo,
+                 punch_type = :punch_type,
+                 punch_time = :punch_time,
                  updated_at = NOW()
-             WHERE id = ?"
+             WHERE id = :id"
         );
 
-        $updateStmt->bind_param(
-            "ssssi",
-            $role,
-            $updatedPhotos,
-            $punch_type,
-            $device_time,
-            $existingRow['id']
-        );
-
-        $updateStmt->execute();
-        $updateStmt->close();
+        $updateStmt->execute([
+            ':role'       => $role,
+            ':photo'      => $updatedPhotos,
+            ':punch_type' => $punch_type,
+            ':punch_time' => $device_time,
+            ':id'         => $existingRow['id']
+        ]);
 
     } else {
-        // 7 placeholders — all strings
         $insertStmt = $conn->prepare(
             "INSERT INTO attendance
                 (emp_id, role, photo, punch_type, punch_date, punch_time, day, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), NOW())"
+             VALUES (:emp_id, :role, :photo, :punch_type, :punch_date, :punch_time, :day, NOW(), NOW())"
         );
 
-        $insertStmt->bind_param(
-            "sssssss",
-            $resolved_emp_id,
-            $role,
-            $imagePath,
-            $punch_type,
-            $device_date,
-            $device_time,
-            $day
-        );
-
-        $insertStmt->execute();
-        $insertStmt->close();
+        $insertStmt->execute([
+            ':emp_id'     => $resolved_emp_id,
+            ':role'       => $role,
+            ':photo'      => $imagePath,
+            ':punch_type' => $punch_type,
+            ':punch_date' => $device_date,
+            ':punch_time' => $device_time,
+            ':day'        => $day
+        ]);
     }
 
     // ── 5. Success response ──
+    // Only return fields that exist in the table.
     echo json_encode([
         "status"     => "success",
         "message"    => "Attendance recorded successfully",
@@ -236,11 +221,9 @@ try {
         "day"        => $day
     ]);
 
-    $conn->close();
-
 } catch (Throwable $e) {
     echo json_encode([
-        "status"  => "error",
+        "status"  => false,
         "message" => "Server exception: " . $e->getMessage()
     ]);
 }

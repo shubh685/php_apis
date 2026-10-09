@@ -1,5 +1,5 @@
 <?php
-// Hide PHP errors from direct output (log them instead)
+// Prevent PHP errors from printing HTML into the JSON response
 ini_set('display_errors', 0);
 ini_set('log_errors', 1);
 error_reporting(E_ALL);
@@ -14,117 +14,73 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit();
 }
 
-mysqli_report(MYSQLI_REPORT_ERROR | MYSQLI_REPORT_STRICT);
+require_once __DIR__ . '/data.php';
 
 try {
-    $conn = new mysqli("localhost", "root", "", "bhadra_foods");
-    $conn->set_charset("utf8mb4");
+    $db = new Database();
+    $conn = $db->getConnection();
 
-    $emp_id_input = trim($_GET['emp_id'] ?? 'all');
+    if (!$conn) {
+        throw new Exception("Database connection failed.");
+    }
 
-    if ($emp_id_input === 'all' || $emp_id_input === '') {
-        // Fetch all records — JOIN users to resolve alphanumeric emp_id
-        $sql = "SELECT a.id,
-                       a.emp_id AS internal_id,
-                       u.emp_id AS emp_id,
-                       a.role, a.photo, a.punch_type,
-                       a.punch_date, a.punch_time, a.day,
-                       a.created_at, a.updated_at
-                FROM attendance a
-                LEFT JOIN users u ON u.id = a.emp_id
-                ORDER BY a.punch_date DESC, a.id DESC";
+    $emp_id_input = trim($_GET['emp_id'] ?? $_GET['user_id'] ?? '');
 
-        $stmt = $conn->prepare($sql);
+    // Support "all" for admin view
+    $fetchAll = (strtolower($emp_id_input) === 'all');
+
+    if (!$fetchAll && $emp_id_input === '') {
+        echo json_encode([
+            "status" => false,
+            "message" => "Employee ID or User ID is required",
+            "history" => []
+        ]);
+        exit();
+    }
+
+    if ($fetchAll) {
+        // Fetch all records using PDO
+        $stmt = $conn->prepare("SELECT * FROM attendance ORDER BY id DESC");
+        $stmt->execute();
     } else {
-        // 1. Resolve internal user ID from users table as done in punch_attendance.php
-        $lookupSql = "SELECT id FROM users WHERE emp_id = ? LIMIT 1";
-        $lookupStmt = $conn->prepare($lookupSql);
-        $lookupStmt->bind_param("s", $emp_id_input);
-        $lookupStmt->execute();
-        $lookupRes = $lookupStmt->get_result();
+        // Step 1: Resolve internal numeric user ID using the alphanumeric emp_id (e.g., 'BHFSO-01')
+        $userStmt = $conn->prepare("SELECT id FROM users WHERE emp_id = :emp_id LIMIT 1");
+        $userStmt->execute([':emp_id' => $emp_id_input]);
+        $userData = $userStmt->fetch(PDO::FETCH_ASSOC);
 
-        $internalId = null;
-        if ($lookupRes->num_rows > 0) {
-            $row = $lookupRes->fetch_assoc();
-            $internalId = (string)$row['id'];
-        }
-        $lookupStmt->close();
-
-        // 2. If user is not found in users table, check if emp_id exists directly in attendance
-        if ($internalId === null) {
-            $checkAttendanceSql = "SELECT COUNT(*) as count FROM attendance WHERE emp_id = ?";
-            $checkStmt = $conn->prepare($checkAttendanceSql);
-            $checkStmt->bind_param("s", $emp_id_input);
-            $checkStmt->execute();
-            $checkRes = $checkStmt->get_result()->fetch_assoc();
-            $checkStmt->close();
-
-            if (($checkRes['count'] ?? 0) == 0) {
-                echo json_encode([
-                    "status"  => true,
-                    "message" => "No user or attendance found for emp_id: $emp_id_input",
-                    "data"    => [],
-                    "history" => [],
-                    "count"   => 0
-                ]);
-                $conn->close();
-                exit();
-            }
+        if ($userData) {
+            $resolved_id = $userData['id'];
+        } else {
+            // Fallback in case $emp_id_input was already the internal numeric ID
+            $resolved_id = $emp_id_input;
         }
 
-        // 3. Match attendance records by internal user ID or raw emp_id
-        $sql = "SELECT a.id,
-                       a.emp_id AS internal_id,
-                       u.emp_id AS emp_id,
-                       a.role, a.photo, a.punch_type,
-                       a.punch_date, a.punch_time, a.day,
-                       a.created_at, a.updated_at
-                FROM attendance a
-                LEFT JOIN users u ON u.id = a.emp_id
-                WHERE a.emp_id = ? OR a.emp_id = ?
-                ORDER BY a.punch_date DESC, a.id DESC";
-
-        $stmt = $conn->prepare($sql);
-        $targetId = $internalId ?? $emp_id_input;
-        $stmt->bind_param("ss", $targetId, $emp_id_input);
+        // Step 2: Query attendance using resolved ID or direct input match (REMOVED user_id)
+        $stmt = $conn->prepare(
+            "SELECT * FROM attendance 
+             WHERE emp_id = :resolved_id 
+                OR emp_id = :input_id 
+             ORDER BY id DESC"
+        );
+        $stmt->execute([
+            ':resolved_id' => $resolved_id,
+            ':input_id'    => $emp_id_input
+        ]);
     }
 
-    $stmt->execute();
-    $result = $stmt->get_result();
-
-    $history = [];
-    while ($row = $result->fetch_assoc()) {
-        $row['id']         = (int)$row['id'];
-        $row['emp_id']     = (string)($row['emp_id'] ?? $row['internal_id'] ?? '');
-        $row['photo']      = $row['photo']      ?? '';
-        $row['role']       = $row['role']       ?? '';
-        $row['punch_type'] = $row['punch_type'] ?? '';
-        $row['punch_date'] = $row['punch_date'] ?? '';
-        $row['punch_time'] = $row['punch_time'] ?? '';
-        $row['day']        = $row['day']        ?? '';
-        $row['created_at'] = $row['created_at'] ?? '';
-        $row['updated_at'] = $row['updated_at'] ?? '';
-        unset($row['internal_id']);
-
-        $history[] = $row;
-    }
-
-    $stmt->close();
-    $conn->close();
+    $history = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
     echo json_encode([
-        "status"  => true,
+        "status" => true,
         "message" => "Attendance fetched successfully",
-        "data"    => $history,
-        "history" => $history,
-        "count"   => count($history)
+        "count" => count($history),
+        "history" => $history
     ]);
 
 } catch (Throwable $e) {
     echo json_encode([
-        "status"  => false,
-        "message" => "Server error: " . $e->getMessage(),
-        "data"    => [],
+        "status" => false,
+        "message" => "Server exception: " . $e->getMessage(),
         "history" => []
     ]);
 }
